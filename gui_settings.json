@@ -6,6 +6,8 @@
   "audio_extract": false,
   "audio_format": "mp3",
   "audio_quality": "192",
+  "audio_normalize": false,
+  "audio_sample_rate": "",
   "embed_thumbnail": true,
   "write_thumbnail": false,
   "embed_metadata": true,
@@ -26,5 +28,11 @@
   "date_before": "",
   "cookie_browser": "",
   "cookie_file": "",
-  "ffmpeg_path": "C:/Users/denni/Desktop/Programs/ffmpeg-2025-09-01-git-3ea6c2fe25-full_build/bin/ffmpeg.exe"
+  "ffmpeg_path": "C:/Users/denni/Desktop/Programs/ffmpeg-2025-09-01-git-3ea6c2fe25-full_build/bin/ffmpeg.exe",
+  "conv_output_dir": "C:\\Users\\denni\\Downloads",
+  "conv_format_type": "Audio",
+  "conv_output_format": "MP3",
+  "conv_audio_quality": "192",
+  "conv_video_crf": "23",
+  "conv_overwrite": true
 }
