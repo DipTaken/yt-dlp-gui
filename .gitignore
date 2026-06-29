@@ -132,3 +132,8 @@ yt-dlp-plugins
 
 # Packages
 yt_dlp_ejs/
+
+# GUI app
+gui_settings.json
+Python/
+python_install_*.log
