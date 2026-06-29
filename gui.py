@@ -291,6 +291,10 @@ class ConvItem:
             except Exception:
                 pass
 
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel.is_set()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # App
@@ -318,6 +322,10 @@ class App(tk.Tk):
 
         # FFmpeg state (resolved at startup; may be overridden by settings)
         self._ffmpeg_path = self._resolve_ffmpeg()
+
+        # One-shot callback for the "Update yt-dlp" worker; set by the
+        # settings dialog, consumed once by _handle('update_result').
+        self._pending_update_callback = None
 
         # Global mousewheel routing (accumulator allows fractional touchpad deltas)
         self._wheel_target: 'tk.Canvas | None' = None
@@ -1731,7 +1739,7 @@ class App(tk.Tk):
             self._update_conv_card(msg[1])
 
         elif kind == 'update_result':
-            cb = getattr(self, '_pending_update_callback', None)
+            cb = self._pending_update_callback
             if cb:
                 try:
                     cb(msg[1], msg[2])
@@ -2382,7 +2390,7 @@ class App(tk.Tk):
             item._proc = proc
 
             for line in proc.stderr:
-                if item._cancel.is_set():
+                if item.is_cancelled:
                     proc.terminate()
                     break
                 m = re.search(r'time=(\d+):(\d+):(\d+\.\d+)', line)
@@ -2395,7 +2403,7 @@ class App(tk.Tk):
 
             proc.wait()
 
-            if item._cancel.is_set():
+            if item.is_cancelled:
                 item.status = ConvItem.CANCELLED
             elif proc.returncode == 0:
                 item.status   = ConvItem.DONE
@@ -2405,7 +2413,7 @@ class App(tk.Tk):
                 item.error  = f'FFmpeg exited with code {proc.returncode}'
 
         except Exception as exc:
-            if item._cancel.is_set():
+            if item.is_cancelled:
                 item.status = ConvItem.CANCELLED
             else:
                 item.status = ConvItem.ERROR
