@@ -17,6 +17,7 @@ from tkinter import filedialog, ttk
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadCancelled, format_bytes
 
+from .clip_editor import ClipEditor
 from .config import (
     COMPAT_MODES, CONV_AUDIO_FORMATS, CONV_FORMAT_INFO, CONV_FPS_CHOICES,
     CONV_INTRA_PROFILES, CONV_LOSSLESS, CONV_LOUDNESS, CONV_PRESETS,
@@ -273,6 +274,100 @@ class App(tk.Tk):
             pass
 
     # ─── Settings dialog ─────────────────────────────────────────────────────
+    # ─── Clip editor ─────────────────────────────────────────────────────────
+    def _open_clip_editor(self, item_id: str):
+        """Pick in/out points for a queued download.
+
+        The queue holds page URLs, not media, so the editor is handed a
+        resolver that asks yt-dlp for a direct stream. A small format is
+        requested deliberately: every scrub is an HTTP range request, and a
+        360p stream seeks in a fraction of the time a 4K one takes.
+        """
+        item = self.items.get(item_id)
+        if not item:
+            return
+        if not self._ffmpeg_path:
+            self._log('[ERR]  The clip editor needs FFmpeg. '
+                      'Set its path in Preferences → Tools.\n', 'red')
+            return
+
+        def resolve():
+            opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
+                    'noplaylist': True,
+                    # Prefer a small progressive stream: one URL, cheap to seek.
+                    'format': 'best[height<=480][acodec!=none][vcodec!=none]'
+                              '/best[height<=720]/best'}
+            s = self.settings
+            if s.get('proxy'):
+                opts['proxy'] = s['proxy']
+            if s.get('cookie_browser'):
+                opts['cookiesfrombrowser'] = (s['cookie_browser'],)
+            if s.get('cookie_file') and os.path.isfile(s['cookie_file']):
+                opts['cookiefile'] = s['cookie_file']
+            try:
+                with YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(item.url, download=False)
+                if not info:
+                    return ''
+                if info.get('_type') in ('playlist', 'multi_video'):
+                    entries = [e for e in (info.get('entries') or []) if e]
+                    if not entries:
+                        return ''
+                    info = entries[0]
+                return info.get('url') or ''
+            except Exception as exc:
+                self.msg_q.put(('log', f'[ERR]  Clip preview: {exc}\n', 'red'))
+                return ''
+
+        start = self._parse_clip_range(self.settings)
+        ClipEditor(
+            self, source=item.url, title=self._trunc(item.title, 60),
+            ffmpeg=self._ffmpeg_path, resolver=resolve,
+            initial_in=(start[0] if start else 0.0),
+            initial_out=(start[1] if start and start[1] != float('inf') else None),
+            on_apply=self._apply_clip_range)
+
+    def _apply_clip_range(self, start, end):
+        """Write the editor's choice back into the Start/End boxes."""
+        if start is None:
+            self.clip_start_var.set('')
+            self.clip_end_var.set('')
+            self._log('Clip range cleared (full length).\n', 'blue')
+        else:
+            self.clip_start_var.set(self._clock(start))
+            self.clip_end_var.set(self._clock(end))
+            self._log(f'Clip range set: {self._clock(start)} → {self._clock(end)}\n',
+                      'blue')
+        self._collect_settings()
+
+    @staticmethod
+    def _clock(seconds: float) -> str:
+        h, rem = divmod(float(seconds or 0), 3600)
+        m, s = divmod(rem, 60)
+        return f'{int(h):02d}:{int(m):02d}:{s:06.3f}'
+
+    def _open_conv_clip_editor(self, item_id: str):
+        """Pick trim points for a local converter file — no resolving needed."""
+        item = self.conv_items.get(item_id)
+        if not item:
+            return
+        if not self._ffmpeg_path:
+            self._log('[ERR]  The clip editor needs FFmpeg. '
+                      'Set its path in Preferences → Tools.\n', 'red')
+            return
+        if not os.path.isfile(item.path):
+            self._log(f'[ERR]  File is gone: {item.path}\n', 'red')
+            return
+
+        def apply_trim(start, end):
+            self.conv_trim_start_var.set('' if start is None else self._clock(start))
+            self.conv_trim_end_var.set('' if end is None else self._clock(end))
+            self._collect_conv_settings()
+            self._log('Trim range applied to the converter settings.\n', 'blue')
+
+        ClipEditor(self, source=item.path, title=item.filename,
+                   ffmpeg=self._ffmpeg_path, on_apply=apply_trim)
+
     def _open_preferences(self):
         """Open (or re-focus) the Preferences window."""
         existing = getattr(self, '_prefs_win', None)
@@ -878,8 +973,16 @@ class App(tk.Tk):
                                command=lambda iid=item.id: self._cancel_item(iid))
         action_btn.pack(side='right')
 
+        clip_btn = tk.Button(bot, text='✂', bg=self._CARD_BG, fg=SUBT0,
+                             font=('Segoe UI', 9), relief='flat', bd=0,
+                             padx=6, pady=2, cursor='hand2',
+                             activebackground=SURF1, activeforeground=TEXT,
+                             command=lambda iid=item.id: self._open_clip_editor(iid))
+        clip_btn.pack(side='right', padx=(0, 4))
+        self._tooltip(clip_btn, 'Set in/out points visually (or double-click the card)')
+
         wdg = {
-            'card': card, 'check_var': check_var,
+            'card': card, 'check_var': check_var, 'clip_btn': clip_btn,
             'title_lbl': title_lbl, 'status_lbl': status_lbl,
             'prog': prog, 'info_lbl': info_lbl,
             'action_btn': action_btn,
@@ -889,6 +992,10 @@ class App(tk.Tk):
 
         # Bind scroll events so hovering over a card still scrolls the queue
         self._bind_scroll_on(card, self._q_canvas)
+        # Double-click anywhere on the card opens the clip editor.
+        for w in (card, top, bot, title_lbl, info_lbl):
+            w.bind('<Double-Button-1>',
+                   lambda _e, iid=item.id: self._open_clip_editor(iid))
 
     def _remove_card(self, item_id: str):
         # Cancel the item first so any still-running daemon thread stops
@@ -1993,8 +2100,16 @@ class App(tk.Tk):
                                command=lambda: self.conv_items.get(item.id) and self.conv_items[item.id].cancel())
         action_btn.pack(side='right')
 
+        clip_btn = tk.Button(bot, text='✂', bg=self._CONV_CARD_BG, fg=SUBT0,
+                             font=('Segoe UI', 9), relief='flat', bd=0,
+                             padx=6, pady=2, cursor='hand2',
+                             activebackground=SURF1, activeforeground=TEXT,
+                             command=lambda iid=item.id: self._open_conv_clip_editor(iid))
+        clip_btn.pack(side='right', padx=(0, 4))
+        self._tooltip(clip_btn, 'Pick trim points visually (or double-click the card)')
+
         wdg = {
-            'card': card, 'chk_var': chk_var,
+            'card': card, 'chk_var': chk_var, 'clip_btn': clip_btn,
             'name_lbl': name_lbl, 'ext_badge': ext_badge,
             'status_lbl': status_lbl, 'prog': prog,
             'info_lbl': info_lbl, 'action_btn': action_btn,
@@ -2002,6 +2117,9 @@ class App(tk.Tk):
         }
         self._conv_widgets[item.id] = wdg
         self._bind_scroll_on(card, self._conv_canvas)
+        for w in (card, top, bot, name_lbl, info_lbl):
+            w.bind('<Double-Button-1>',
+                   lambda _e, iid=item.id: self._open_conv_clip_editor(iid))
 
     def _update_conv_card(self, item: ConvItem):
         wdg = self._conv_widgets.get(item.id)

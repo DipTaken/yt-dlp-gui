@@ -76,3 +76,23 @@ The repo also contains the full upstream yt-dlp source tree:
 `yt_dlp/`, `devscripts/`, `bundle/`, `test/`, `Makefile`, `pyproject.toml`, `Changelog.md`, `CONTRIBUTING.md`, `Maintainers.md`, `supportedsites.md`, `uv.lock`, `yt-dlp.sh`, `yt-dlp.cmd`, `.pre-commit-*.yaml`, `THIRD_PARTY_LICENSES.txt`, `public.key`.
 
 Don't modify these unless explicitly asked — they're upstream and any edits will conflict on the next sync.
+
+## Clip editor (clip_editor.py)
+
+There is no video widget in tkinter. The preview is a single frame extracted
+per seek (`ffmpeg -ss T -i SRC -frames:v 1 -f image2pipe -c:v png -`) fed
+straight into a `tk.PhotoImage` — Tk 8.6 decodes PNG natively, so there is no
+Pillow dependency. Continuous playback is intentionally not implemented.
+
+- The render worker **drains its queue to the newest request** before decoding.
+  Scrubbing produces far more requests than ffmpeg can service; without this the
+  preview lags behind the cursor working through a backlog.
+- The waveform is `showwavespic`; keyframes come from a **packet** scan
+  (`ffprobe -show_packets`), which does not decode and so stays fast.
+- Worker threads must never call `winfo_width()` or touch any widget — the
+  timeline width is cached into `self._timeline_w` from the `<Configure>`
+  handler on the main thread. A Tk call from a worker fails silently inside the
+  caller's `except` and looks like "ffmpeg produced nothing".
+- Queue items are page URLs, so a `resolver` callback asks yt-dlp for a direct
+  stream first, deliberately requesting a small format — every scrub is an HTTP
+  range request.
