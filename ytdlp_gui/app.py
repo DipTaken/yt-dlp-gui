@@ -34,6 +34,7 @@ from .ffmpeg_utils import (
     same_file,
 )
 from .models import ConvItem, DownloadItem, GUILogger
+from .preferences import PreferencesWindow
 from .theme import (
     BASE, BLUE, CRUST, GREEN, MANTLE, MAUVE, OVL0, PEACH, RED, SUBT0, SURF0,
     SURF1, SURF2, TEXT, YELLOW, apply_dark_titlebar, build_styles,
@@ -85,6 +86,7 @@ class App(tk.Tk):
         self._wheel = WheelRouter(self)
 
         self._build_styles()
+        self._create_setting_vars()
         self._build_ui()
         self._bind_shortcuts()
         self._poll()
@@ -194,7 +196,7 @@ class App(tk.Tk):
                  font=('Segoe UI', 9)).pack(side='left', pady=12)
 
         # Settings gear button (right side, packed before URL so it's rightmost)
-        tk.Button(hdr, text=' ⚙ ', command=self._open_settings_dialog,
+        tk.Button(hdr, text=' ⚙ ', command=self._open_preferences,
                   bg=SURF0, fg=SUBT0, font=('Segoe UI', 11),
                   relief='flat', bd=0, padx=10, pady=6,
                   cursor='hand2', activebackground=SURF1,
@@ -204,7 +206,7 @@ class App(tk.Tk):
         self._ffmpeg_badge = tk.Label(hdr, bg=MANTLE, font=('Segoe UI', 8, 'bold'),
                                       cursor='hand2')
         self._ffmpeg_badge.pack(side='right', padx=(4, 2))
-        self._ffmpeg_badge.bind('<Button-1>', lambda _e: self._open_settings_dialog())
+        self._ffmpeg_badge.bind('<Button-1>', lambda _e: self._open_preferences())
         self._refresh_ffmpeg_badge()
 
         # URL entry
@@ -271,143 +273,14 @@ class App(tk.Tk):
             pass
 
     # ─── Settings dialog ─────────────────────────────────────────────────────
-    def _open_settings_dialog(self):
-        dlg = tk.Toplevel(self)
-        dlg.title('App Settings')
-        dlg.geometry('560x360')
-        dlg.configure(bg=BASE)
-        dlg.transient(self)
-        dlg.grab_set()
-        dlg.resizable(False, False)
-        self._apply_dark_titlebar(dlg)
-
-        # ── FFmpeg section ────────────────────────────────────────────────────
-        self._dlg_sec(dlg, 'FFMPEG')
-
-        ffmpeg_frame = tk.Frame(dlg, bg=BASE)
-        ffmpeg_frame.pack(fill='x', padx=20, pady=(4, 0))
-
-        tk.Label(ffmpeg_frame,
-                 text='Path to ffmpeg executable  (leave blank to auto-detect)',
-                 bg=BASE, fg=SUBT0, font=('Segoe UI', 9)).pack(anchor='w')
-
-        row = tk.Frame(ffmpeg_frame, bg=BASE)
-        row.pack(fill='x', pady=(3, 0))
-
-        ffmpeg_var = tk.StringVar(value=self.settings.get('ffmpeg_path', ''))
-        entry = tk.Entry(row, textvariable=ffmpeg_var,
-                         bg=SURF0, fg=TEXT, insertbackground=TEXT,
-                         font=('Segoe UI', 10), relief='flat', bd=0,
-                         highlightthickness=1, highlightbackground=SURF1,
-                         highlightcolor=MAUVE)
-        entry.pack(side='left', fill='x', expand=True, ipady=5)
-
-        def browse_ffmpeg():
-            p = filedialog.askopenfilename(
-                filetypes=[('FFmpeg executable', 'ffmpeg ffmpeg.exe'), ('All', '*.*')],
-                title='Locate ffmpeg')
-            if p:
-                ffmpeg_var.set(p)
-
-        tk.Button(row, text='Browse', command=browse_ffmpeg,
-                  bg=SURF0, fg=TEXT, font=('Segoe UI', 9), relief='flat', bd=0,
-                  padx=10, pady=5, cursor='hand2',
-                  activebackground=SURF1).pack(side='left', padx=(6, 0))
-
-        # Status line
-        detected = find_ffmpeg()
-        status_text = f'Auto-detected: {detected}' if detected else 'Not found on PATH or common locations'
-        status_col  = GREEN if detected else YELLOW
-        tk.Label(ffmpeg_frame, text=status_text, bg=BASE, fg=status_col,
-                 font=('Segoe UI', 8)).pack(anchor='w', pady=(4, 0))
-
-        # ── yt-dlp section ────────────────────────────────────────────────────
-        self._dlg_sec(dlg, 'YT-DLP')
-
-        yt_frame = tk.Frame(dlg, bg=BASE)
-        yt_frame.pack(fill='x', padx=20, pady=(4, 0))
-
-        try:
-            from yt_dlp.version import __version__ as ytdlp_ver
-        except Exception:
-            ytdlp_ver = 'unknown'
-
-        ver_row = tk.Frame(yt_frame, bg=BASE)
-        ver_row.pack(fill='x')
-        tk.Label(ver_row, text=f'Bundled version: {ytdlp_ver}',
-                 bg=BASE, fg=SUBT0, font=('Segoe UI', 9)).pack(side='left')
-
-        update_status = tk.Label(yt_frame, text='', bg=BASE, fg=SUBT0,
-                                 font=('Segoe UI', 8))
-        update_status.pack(anchor='w', pady=(4, 0))
-
-        def run_update():
-            update_btn.configure(state='disabled', text='Updating…')
-            update_status.configure(text='Running: pip install -U yt-dlp', fg=YELLOW)
-
-            def worker():
-                try:
-                    proc = subprocess.run(
-                        [sys.executable, '-m', 'pip', 'install', '-U', 'yt-dlp'],
-                        capture_output=True, text=True, timeout=180)
-                    ok = (proc.returncode == 0)
-                    tail = (proc.stdout or proc.stderr or '').strip().splitlines()[-1:]
-                    msg = tail[0] if tail else ('Updated.' if ok else 'Failed.')
-                except Exception as exc:
-                    ok, msg = False, str(exc)
-                self.msg_q.put(('update_result', ok, msg))
-
-            def on_done(ok, msg):
-                update_btn.configure(state='normal', text='Update yt-dlp')
-                update_status.configure(text=msg, fg=GREEN if ok else RED)
-                self._log(f'[{"OK" if ok else "FAIL"}] yt-dlp update: {msg}\n',
-                          'green' if ok else 'red')
-
-            self._pending_update_callback = on_done
-            threading.Thread(target=worker, daemon=True).start()
-
-        update_btn = tk.Button(ver_row, text='Update yt-dlp', command=run_update,
-                               bg=SURF0, fg=TEXT, font=('Segoe UI', 9),
-                               relief='flat', bd=0, padx=10, pady=4, cursor='hand2',
-                               activebackground=SURF1, activeforeground=TEXT)
-        update_btn.pack(side='right')
-
-        # ── Buttons ───────────────────────────────────────────────────────────
-        tk.Frame(dlg, bg=SURF1, height=1).pack(fill='x', pady=(20, 0))
-        btn_row = tk.Frame(dlg, bg=BASE)
-        btn_row.pack(fill='x', padx=20, pady=12)
-
-        _bkw = {'font': ('Segoe UI', 9), 'relief': 'flat', 'bd': 0,
-                 'padx': 14, 'pady': 6, 'cursor': 'hand2'}
-
-        def save():
-            self.settings['ffmpeg_path'] = ffmpeg_var.get().strip()
-            self._ffmpeg_path = self._resolve_ffmpeg()
-            self._refresh_ffmpeg_badge()
-            self._save_settings()
-            dlg.destroy()
-
-        tk.Button(btn_row, text='Save', command=save,
-                  bg=MAUVE, fg=CRUST, activebackground='#b89be6',
-                  font=('Segoe UI', 9, 'bold'), relief='flat', bd=0,
-                  padx=14, pady=6, cursor='hand2').pack(side='left')
-        tk.Button(btn_row, text='Cancel', command=dlg.destroy,
-                  bg=SURF0, fg=TEXT, activebackground=SURF1,
-                  **_bkw).pack(side='left', padx=(8, 0))
-
-        # Help text
-        tk.Label(btn_row,
-                 text='Merging formats, thumbnail embedding, and subtitle embedding all require FFmpeg.',
-                 bg=BASE, fg=OVL0, font=('Segoe UI', 8),
-                 wraplength=340, justify='left').pack(side='left', padx=(16, 0))
-
-    def _dlg_sec(self, parent, text):
-        f = tk.Frame(parent, bg=BASE)
-        f.pack(fill='x', padx=20, pady=(16, 4))
-        tk.Label(f, text=text, bg=BASE, fg=MAUVE,
-                 font=('Segoe UI', 9, 'bold')).pack(side='left')
-        tk.Frame(f, bg=SURF1, height=1).pack(side='left', fill='x',
-                                             expand=True, padx=(8, 0), pady=3)
+    def _open_preferences(self):
+        """Open (or re-focus) the Preferences window."""
+        existing = getattr(self, '_prefs_win', None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+        self._prefs_win = PreferencesWindow(self)
 
     # ─── Queue panel ─────────────────────────────────────────────────────────
     def _build_queue_panel(self, parent):
@@ -499,42 +372,42 @@ class App(tk.Tk):
         self._wheel.bind_tree(widget, canvas)
 
     def _populate_settings(self, inner):
+        """The sidebar holds only what changes between downloads.
+
+        Everything configured once and then forgotten — network, cookies,
+        filters, the raw filename template, the archive — lives in the
+        Preferences window instead. Groups that are toggled on and off rather
+        than tuned per download start collapsed.
+        """
         P = {'padx': 16, 'pady': 3}
 
         # ── FORMAT ───────────────────────────────────────────────────────────
         body = self._sec(inner, 'FORMAT')
-        self.fmt_preset_var = tk.StringVar(value=self.settings['format_preset'])
         preset_anchor = self._labeled_combo(
-            body, 'Format Preset',
-            self.fmt_preset_var, list(FORMAT_PRESETS.keys()),
-            on_select=self._on_format_change)
+            body, 'Format Preset', self.fmt_preset_var,
+            list(FORMAT_PRESETS.keys()), on_select=self._on_format_change)
 
         self._custom_fmt_frame = tk.Frame(body, bg=MANTLE)
         self._custom_fmt_anchor = preset_anchor
         tk.Label(self._custom_fmt_frame, text='Custom Format String',
                  bg=MANTLE, fg=SUBT0, font=('Segoe UI', 9)).pack(anchor='w')
-        self.custom_fmt_var = tk.StringVar(value=self.settings['custom_format'])
-        self._entry(self._custom_fmt_frame, self.custom_fmt_var).pack(fill='x', pady=(2, 0), ipady=4)
+        self._entry(self._custom_fmt_frame, self.custom_fmt_var).pack(
+            fill='x', pady=(2, 0), ipady=4)
         tk.Label(self._custom_fmt_frame,
-                 text='Raw yt-dlp -f selector. Codec/container preference below '
-                      'is not applied to custom selectors.',
+                 text='Raw yt-dlp -f selector. The codec preference below is '
+                      'not applied to custom selectors.',
                  bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
                  wraplength=330, justify='left').pack(anchor='w', pady=(2, 0))
 
-        # Codec / container policy — the knob that decides whether you get a
-        # universally-playable MP4 or a higher-quality AV1/Opus MKV.
-        self.compat_var = tk.StringVar(value=self.settings['compat_mode'])
         self._compat_anchor = self._labeled_combo(
-            body, 'Codec / Container Preference',
-            self.compat_var, list(COMPAT_MODES.keys()),
-            on_select=self._on_compat_change)
+            body, 'Codec / Container Preference', self.compat_var,
+            list(COMPAT_MODES.keys()), on_select=self._on_compat_change)
         self._compat_help = tk.Label(body, text='', bg=MANTLE, fg=SURF2,
                                      font=('Segoe UI', 8), wraplength=330,
                                      justify='left')
         self._compat_help.pack(anchor='w', padx=16, pady=(0, 2))
         self._on_compat_change()
 
-        self.audio_extract_var = tk.BooleanVar(value=self.settings['audio_extract'])
         ttk.Checkbutton(body, text='Extract Audio Only',
                         variable=self.audio_extract_var,
                         command=self._on_audio_toggle).pack(anchor='w', **P)
@@ -542,30 +415,26 @@ class App(tk.Tk):
         self._audio_opts_frame = tk.Frame(body, bg=MANTLE)
         arow = tk.Frame(self._audio_opts_frame, bg=MANTLE)
         arow.pack(fill='x')
-        self.audio_fmt_var = tk.StringVar(value=self.settings['audio_format'])
-        self.audio_q_var   = tk.StringVar(value=self.settings['audio_quality'])
         self._mini_combo(arow, 'Audio Format', self.audio_fmt_var,
-                         ['mp3', 'aac', 'm4a', 'flac', 'wav', 'ogg', 'opus', 'vorbis', 'alac'])
+                         ['mp3', 'aac', 'm4a', 'flac', 'wav', 'ogg', 'opus',
+                          'vorbis', 'alac'])
         tk.Frame(arow, bg=MANTLE, width=12).pack(side='left')
         self._mini_combo(arow, 'Quality (kbps)', self.audio_q_var,
                          ['best', '320', '256', '192', '128', '96', '64', '32'])
 
         arow2 = tk.Frame(self._audio_opts_frame, bg=MANTLE)
         arow2.pack(fill='x', pady=(6, 0))
-        self.audio_sr_var = tk.StringVar(value=self.settings['audio_sample_rate'])
         self._mini_combo(arow2, 'Sample Rate', self.audio_sr_var,
                          ['', '22050', '44100', '48000', '96000'])
         tk.Label(arow2, text='(blank = keep original)', bg=MANTLE, fg=OVL0,
                  font=('Segoe UI', 8)).pack(side='left', padx=(8, 0), pady=(16, 0))
 
-        self.audio_norm_var = tk.BooleanVar(value=self.settings['audio_normalize'])
-        ttk.Checkbutton(self._audio_opts_frame, text='Normalize Audio Volume (FFmpeg loudnorm)',
+        ttk.Checkbutton(self._audio_opts_frame,
+                        text='Normalize Audio Volume (FFmpeg loudnorm)',
                         variable=self.audio_norm_var).pack(anchor='w', pady=(4, 0))
-        self.keep_video_var = tk.BooleanVar(value=self.settings['keep_video'])
         ttk.Checkbutton(self._audio_opts_frame,
                         text='Keep the original video file as well',
                         variable=self.keep_video_var).pack(anchor='w')
-        self.music_tags_var = tk.BooleanVar(value=self.settings['music_tags'])
         ttk.Checkbutton(self._audio_opts_frame,
                         text='Tag from "Artist - Title" in the video title',
                         variable=self.music_tags_var).pack(anchor='w')
@@ -578,77 +447,48 @@ class App(tk.Tk):
         self._on_format_change()
         self._on_audio_toggle()
 
-        # ── OUTPUT ───────────────────────────────────────────────────────────
-        body = self._sec(inner, 'OUTPUT')
-        self.outdir_var = tk.StringVar(value=self.settings['output_dir'])
-        self._browse_row(body, 'Save To', self.outdir_var, self._browse_dir)
-
-        self.tmpl_preset_var = tk.StringVar(value=self.settings['template_preset'])
+        # ── SAVE TO ──────────────────────────────────────────────────────────
+        body = self._sec(inner, 'SAVE TO')
+        self._browse_row(body, 'Folder', self.outdir_var, self._browse_dir)
         self._labeled_combo(body, 'Filename Layout', self.tmpl_preset_var,
                             list(OUTPUT_TEMPLATES.keys()),
                             on_select=self._on_template_preset_change)
+        tk.Label(body, text='Edit the raw template in Preferences → Files.',
+                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8)).pack(anchor='w', padx=16)
 
-        self.tmpl_var = tk.StringVar(value=self.settings['output_template'])
-        f = tk.Frame(body, bg=MANTLE)
-        f.pack(fill='x', **P)
-        tk.Label(f, text='Filename Template', bg=MANTLE, fg=SUBT0,
-                 font=('Segoe UI', 9)).pack(anchor='w')
-        self._tmpl_entry = self._entry(f, self.tmpl_var)
-        self._tmpl_entry.pack(fill='x', pady=(2, 0), ipady=4)
-        self._tmpl_hint = tk.Label(
-            f, text='', bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
-            wraplength=330, justify='left', anchor='w')
-        self._tmpl_hint.pack(anchor='w', fill='x')
-        # Editing the box by hand switches the layout dropdown to Custom.
-        self.tmpl_var.trace_add('write', self._on_template_edited)
-        self._on_template_preset_change(initial=True)
-
-        # ── DOWNLOAD ARCHIVE ─────────────────────────────────────────────────
-        self.archive_var = tk.BooleanVar(value=self.settings['archive_enabled'])
-        ttk.Checkbutton(body, text='Skip anything already downloaded (archive)',
-                        variable=self.archive_var,
-                        command=self._on_archive_toggle).pack(anchor='w', **P)
-        self._archive_anchor = body.pack_slaves()[-1]
-        self._archive_frame = tk.Frame(body, bg=MANTLE)
-        self.archive_file_var = tk.StringVar(value=self.settings['archive_file'])
-        self._browse_row(self._archive_frame, 'Archive File',
-                         self.archive_file_var, self._browse_archive)
-        tk.Label(self._archive_frame,
-                 text='Records every completed video id. Re-running the same '
-                      'playlist then fetches only what is new — the usual way '
-                      'to keep a music library in sync. Blank = archive.txt in '
-                      'the output folder.',
+        # ── CLIPS & CHAPTERS ─────────────────────────────────────────────────
+        body = self._sec(inner, 'CLIPS & CHAPTERS')
+        tk.Label(body, text='Download only part of a video — no need to pull a '
+                            'two-hour stream for a ten-second cutaway.',
+                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
+                 wraplength=330, justify='left').pack(anchor='w', padx=16, pady=(0, 4))
+        cr = tk.Frame(body, bg=MANTLE)
+        cr.pack(fill='x', **P)
+        self._mini_entry(cr, 'Start (1:30)', self.clip_start_var, width=13)
+        tk.Frame(cr, bg=MANTLE, width=10).pack(side='left')
+        self._mini_entry(cr, 'End (blank = to end)', self.clip_end_var, width=13)
+        tk.Label(body, text='Tip: double-click a queued item to set these '
+                            'visually in the clip editor.',
                  bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
                  wraplength=330, justify='left').pack(anchor='w', padx=16)
-        self._on_archive_toggle()
+        self._chk(body, 'Frame-accurate cuts (slower, re-encodes)',
+                  self.clip_precise_var)
+        self._chk(body, 'Split into one file per chapter', self.split_chapters_var)
+        tk.Label(body, text='Splitting turns an album upload, DJ set or long '
+                            'tutorial into separate numbered files.',
+                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
+                 wraplength=330, justify='left').pack(anchor='w', padx=16)
 
-        # ── POST-PROCESSING ───────────────────────────────────────────────────
-        body = self._sec(inner, 'POST-PROCESSING')
-        self.embed_thumb_var = tk.BooleanVar(value=self.settings['embed_thumbnail'])
-        self.write_thumb_var = tk.BooleanVar(value=self.settings['write_thumbnail'])
-        self.embed_meta_var  = tk.BooleanVar(value=self.settings['embed_metadata'])
-        self.write_json_var  = tk.BooleanVar(value=self.settings['write_infojson'])
-        self._chk(body, 'Embed Thumbnail (requires FFmpeg)',      self.embed_thumb_var)
-        self._chk(body, 'Save Thumbnail File',                    self.write_thumb_var)
-        self._chk(body, 'Embed Metadata / ID3 (requires FFmpeg)', self.embed_meta_var)
-        self._chk(body, 'Write Info JSON',                        self.write_json_var)
-
-        # ── SUBTITLES ─────────────────────────────────────────────────────────
-        body = self._sec(inner, 'SUBTITLES')
-        self.write_subs_var = tk.BooleanVar(value=self.settings['write_subs'])
-        self.auto_subs_var  = tk.BooleanVar(value=self.settings['auto_subs'])
-        self.embed_subs_var = tk.BooleanVar(value=self.settings['embed_subs'])
-        self.sub_langs_var  = tk.StringVar(value=self.settings['sub_langs'])
-        self._chk(body, 'Download Subtitles',                         self.write_subs_var)
-        self._chk(body, 'Include Auto-generated',                     self.auto_subs_var)
-        self._chk(body, 'Embed Subtitles into Video (requires FFmpeg)', self.embed_subs_var)
+        # ── SUBTITLES (collapsed) ────────────────────────────────────────────
+        body = self._sec(inner, 'SUBTITLES', collapsed=True)
+        self._chk(body, 'Download Subtitles', self.write_subs_var)
+        self._chk(body, 'Include Auto-generated', self.auto_subs_var)
+        self._chk(body, 'Embed into Video (requires FFmpeg)', self.embed_subs_var)
         f2 = tk.Frame(body, bg=MANTLE)
         f2.pack(fill='x', **P)
         tk.Label(f2, text='Languages (comma-separated, e.g. en,es)',
                  bg=MANTLE, fg=SUBT0, font=('Segoe UI', 9)).pack(anchor='w')
         self._entry(f2, self.sub_langs_var).pack(fill='x', pady=(2, 0), ipady=4)
-
-        self.sub_convert_var = tk.StringVar(value=self.settings['sub_convert'])
         self._labeled_combo(body, 'Convert Subtitles To', self.sub_convert_var,
                             SUB_FORMATS)
         tk.Label(body, text='Sites usually serve VTT; SRT is what editing and '
@@ -656,48 +496,22 @@ class App(tk.Tk):
                  bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
                  wraplength=330, justify='left').pack(anchor='w', padx=16)
 
-        # ── CLIPS & CHAPTERS ──────────────────────────────────────────────────
-        body = self._sec(inner, 'CLIPS & CHAPTERS')
-        tk.Label(body, text='Download only part of a video — no need to pull a '
-                            'two-hour stream for a ten-second cutaway.',
-                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
-                 wraplength=330, justify='left').pack(anchor='w', padx=16, pady=(0, 4))
-        self.clip_start_var = tk.StringVar(value=self.settings['clip_start'])
-        self.clip_end_var   = tk.StringVar(value=self.settings['clip_end'])
-        cr = tk.Frame(body, bg=MANTLE)
-        cr.pack(fill='x', **P)
-        self._mini_entry(cr, 'Start (1:30 / 00:01:30)', self.clip_start_var, width=14)
-        tk.Frame(cr, bg=MANTLE, width=12).pack(side='left')
-        self._mini_entry(cr, 'End (blank = to end)',    self.clip_end_var,   width=14)
+        # ── METADATA & ARTWORK (collapsed) ───────────────────────────────────
+        body = self._sec(inner, 'METADATA & ARTWORK', collapsed=True)
+        self._chk(body, 'Embed Thumbnail (requires FFmpeg)', self.embed_thumb_var)
+        self._chk(body, 'Save Thumbnail File', self.write_thumb_var)
+        self._chk(body, 'Embed Metadata / ID3 (requires FFmpeg)', self.embed_meta_var)
+        self._chk(body, 'Write Info JSON', self.write_json_var)
 
-        self.clip_precise_var = tk.BooleanVar(value=self.settings['clip_precise'])
-        self._chk(body, 'Frame-accurate cuts (slower, re-encodes)',
-                  self.clip_precise_var)
-        tk.Label(body, text='Off = cuts land on the nearest keyframe, which can '
-                            'be a second or two early.',
-                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
-                 wraplength=330, justify='left').pack(anchor='w', padx=16)
-
-        self.split_chapters_var = tk.BooleanVar(value=self.settings['split_chapters'])
-        self._chk(body, 'Split into one file per chapter', self.split_chapters_var)
-        tk.Label(body, text='Turns an album upload, DJ set or long tutorial into '
-                            'separate numbered files.',
-                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
-                 wraplength=330, justify='left').pack(anchor='w', padx=16)
-
-        # ── SPONSORBLOCK ──────────────────────────────────────────────────────
-        body = self._sec(inner, 'SPONSORBLOCK')
-        self.sb_var = tk.BooleanVar(value=self.settings['sponsorblock_enabled'])
+        # ── SPONSORBLOCK (collapsed) ─────────────────────────────────────────
+        body = self._sec(inner, 'SPONSORBLOCK', collapsed=True)
         sb_chk = ttk.Checkbutton(body, text='Enable SponsorBlock',
-                                 variable=self.sb_var,
-                                 command=self._on_sb_toggle)
+                                 variable=self.sb_var, command=self._on_sb_toggle)
         sb_chk.pack(anchor='w', **P)
         self._sb_anchor = sb_chk
         self._sb_frame = tk.Frame(body, bg=MANTLE)
-        self.sb_cats_var = tk.StringVar(value=self.settings['sponsorblock_cats'])
-        self._labeled_combo(self._sb_frame, 'Categories',
-                            self.sb_cats_var, SB_CATEGORIES)
-        self.sb_mode_var = tk.StringVar(value=self.settings['sponsorblock_mode'])
+        self._labeled_combo(self._sb_frame, 'Categories', self.sb_cats_var,
+                            SB_CATEGORIES)
         self._labeled_combo(self._sb_frame, 'Action', self.sb_mode_var, SB_MODES)
         tk.Label(self._sb_frame,
                  text='Remove physically cuts the segments out — useful for '
@@ -706,60 +520,17 @@ class App(tk.Tk):
                  wraplength=330, justify='left').pack(anchor='w', padx=16)
         self._on_sb_toggle()
 
-        # ── NETWORK ───────────────────────────────────────────────────────────
-        body = self._sec(inner, 'NETWORK')
-        self.rate_limit_var = tk.StringVar(value=self.settings['rate_limit'])
-        self.proxy_var      = tk.StringVar(value=self.settings['proxy'])
-        self.retries_var    = tk.StringVar(value=self.settings['retries'])
-        self.concurrent_var = tk.StringVar(value=self.settings['concurrent_fragments'])
-        self._labeled_entry(body, 'Rate Limit (e.g. 2M, 500K — blank = unlimited)',
-                            self.rate_limit_var, width=14)
-        self._labeled_entry(body, 'Proxy (http://… or socks5://…)', self.proxy_var)
-        self.max_conc_var = tk.StringVar(value=self.settings['max_concurrent'])
-        rn = tk.Frame(body, bg=MANTLE)
-        rn.pack(fill='x', **P)
-        self._mini_entry(rn, 'Retries',               self.retries_var,    width=6)
-        tk.Frame(rn, bg=MANTLE, width=12).pack(side='left')
-        self._mini_entry(rn, 'Concurrent Frags',      self.concurrent_var, width=6)
-        tk.Frame(rn, bg=MANTLE, width=12).pack(side='left')
-        self._mini_entry(rn, 'Parallel Downloads',    self.max_conc_var,   width=6)
-
-        # ── COOKIES & AUTH ────────────────────────────────────────────────────
-        body = self._sec(inner, 'COOKIES & AUTH')
-        self.cookie_browser_var = tk.StringVar(value=self.settings['cookie_browser'])
-        self._labeled_combo(body, 'Import Cookies from Browser',
-                            self.cookie_browser_var,
-                            ['', 'chrome', 'firefox', 'edge', 'brave',
-                             'safari', 'chromium', 'opera', 'vivaldi'])
-        self.cookie_file_var = tk.StringVar(value=self.settings['cookie_file'])
-        self._browse_row(body, 'Cookie File (Netscape format)',
-                         self.cookie_file_var, self._browse_cookies)
-
-        # ── FILTERS ───────────────────────────────────────────────────────────
-        body = self._sec(inner, 'FILTERS')
-        self.no_playlist_var = tk.BooleanVar(value=self.settings['no_playlist'])
-        self.maxfs_var       = tk.StringVar(value=self.settings['max_filesize'])
-        self.date_after_var  = tk.StringVar(value=self.settings['date_after'])
-        self.date_before_var = tk.StringVar(value=self.settings['date_before'])
-        self._chk(body, 'Single Video (ignore playlist)', self.no_playlist_var)
-        self._labeled_entry(body, 'Max Filesize (e.g. 500M, 2G)', self.maxfs_var, width=14)
-        dr = tk.Frame(body, bg=MANTLE)
-        dr.pack(fill='x', **P)
-        self._mini_entry(dr, 'Date After  (YYYYMMDD)', self.date_after_var,  width=12)
-        tk.Frame(dr, bg=MANTLE, width=12).pack(side='left')
-        self._mini_entry(dr, 'Date Before (YYYYMMDD)', self.date_before_var, width=12)
-
-        # ── DEFAULTS ──────────────────────────────────────────────────────────
-        body = self._sec(inner, 'DEFAULTS')
-        df = tk.Frame(body, bg=MANTLE)
-        df.pack(fill='x', padx=16, pady=(2, 4))
+        # ── Footer actions ───────────────────────────────────────────────────
+        df = tk.Frame(inner, bg=MANTLE)
+        df.pack(fill='x', padx=16, pady=(18, 4))
         _bkw = {'font': ('Segoe UI', 9), 'relief': 'flat', 'bd': 0,
-                 'padx': 10, 'pady': 5, 'cursor': 'hand2',
-                 'activeforeground': TEXT}
+                'padx': 10, 'pady': 5, 'cursor': 'hand2', 'activeforeground': TEXT}
+        tk.Button(df, text='⚙  Preferences…', command=self._open_preferences,
+                  bg=SURF1, fg=TEXT, activebackground=SURF2, **_bkw).pack(side='left')
         tk.Button(df, text='Save as Defaults', command=self._save_settings_now,
                   bg=SURF0, fg=TEXT, activebackground=SURF1, **_bkw
-                  ).pack(side='left')
-        tk.Button(df, text='Reset to Defaults', command=self._reset_settings,
+                  ).pack(side='left', padx=(6, 0))
+        tk.Button(df, text='Reset', command=self._reset_settings,
                   bg=SURF0, fg=SUBT0, activebackground=SURF1, **_bkw
                   ).pack(side='left', padx=(6, 0))
 
@@ -767,6 +538,7 @@ class App(tk.Tk):
 
         # Bind scroll activation to every widget in the settings panel
         self.after(100, lambda: self._bind_scroll_on(inner, self._s_canvas))
+
 
     # ─── Bottom bar ───────────────────────────────────────────────────────────
     def _build_bottom(self):
@@ -890,17 +662,6 @@ class App(tk.Tk):
         else:
             self._sb_frame.pack_forget()
 
-    def _on_archive_toggle(self):
-        if self.archive_var.get():
-            self._archive_frame.pack(fill='x', padx=16, pady=3,
-                                     after=self._archive_anchor)
-        else:
-            self._archive_frame.pack_forget()
-
-    # Guard so programmatic writes to tmpl_var don't bounce the dropdown back
-    # to Custom via the trace.
-    _suppress_tmpl_trace = False
-
     def _on_template_preset_change(self, _e=None, initial=False):
         name = self.tmpl_preset_var.get()
         tmpl = OUTPUT_TEMPLATES.get(name)
@@ -920,7 +681,15 @@ class App(tk.Tk):
         self._refresh_tmpl_hint()
 
     def _refresh_tmpl_hint(self):
-        """Validate the template live and show what it will produce."""
+        """Validate the template live and show what it will produce.
+
+        The hint label lives in the Preferences window, which may not be open —
+        the trace on tmpl_var fires regardless.
+        """
+        hint = getattr(self, '_tmpl_hint', None)
+        if hint is None or not hint.winfo_exists():
+            return
+        self._tmpl_hint = hint
         tmpl = self.tmpl_var.get().strip()
         if not tmpl:
             self._tmpl_hint.configure(
@@ -950,14 +719,6 @@ class App(tk.Tk):
                 ydl.close()
         except Exception:
             return '(preview unavailable)'
-
-    def _browse_archive(self):
-        path = filedialog.asksaveasfilename(
-            title='Download archive file', defaultextension='.txt',
-            initialfile='archive.txt',
-            filetypes=[('Text files', '*.txt'), ('All files', '*.*')])
-        if path:
-            self.archive_file_var.set(path)
 
     def _browse_dir(self):
         path = filedialog.askdirectory(
@@ -1317,53 +1078,72 @@ class App(tk.Tk):
         self.log_txt.configure(state='disabled')
 
     # ─── Download logic ────────────────────────────────────────────────────────
-    def _setting_var_map(self) -> list:
-        """(settings_key, tk_var) for every download-tab setting bound to a Var."""
-        return [
-            ('format_preset',        self.fmt_preset_var),
-            ('compat_mode',          self.compat_var),
-            ('custom_format',        self.custom_fmt_var),
-            ('audio_extract',        self.audio_extract_var),
-            ('audio_format',         self.audio_fmt_var),
-            ('audio_quality',        self.audio_q_var),
-            ('audio_normalize',      self.audio_norm_var),
-            ('audio_sample_rate',    self.audio_sr_var),
-            ('keep_video',           self.keep_video_var),
-            ('music_tags',           self.music_tags_var),
-            ('output_dir',           self.outdir_var),
-            ('output_template',      self.tmpl_var),
-            ('template_preset',      self.tmpl_preset_var),
-            ('archive_enabled',      self.archive_var),
-            ('archive_file',         self.archive_file_var),
-            ('embed_thumbnail',      self.embed_thumb_var),
-            ('write_thumbnail',      self.write_thumb_var),
-            ('embed_metadata',       self.embed_meta_var),
-            ('write_infojson',       self.write_json_var),
-            ('write_subs',           self.write_subs_var),
-            ('auto_subs',            self.auto_subs_var),
-            ('embed_subs',           self.embed_subs_var),
-            ('sub_langs',            self.sub_langs_var),
-            ('sub_convert',          self.sub_convert_var),
-            ('sponsorblock_enabled', self.sb_var),
-            ('sponsorblock_cats',    self.sb_cats_var),
-            ('sponsorblock_mode',    self.sb_mode_var),
-            ('clip_start',           self.clip_start_var),
-            ('clip_end',             self.clip_end_var),
-            ('clip_precise',         self.clip_precise_var),
-            ('split_chapters',       self.split_chapters_var),
-            ('rate_limit',           self.rate_limit_var),
-            ('proxy',                self.proxy_var),
-            ('retries',              self.retries_var),
-            ('concurrent_fragments', self.concurrent_var),
-            ('max_concurrent',       self.max_conc_var),
-            ('no_playlist',          self.no_playlist_var),
-            ('max_filesize',         self.maxfs_var),
-            ('date_after',           self.date_after_var),
-            ('date_before',          self.date_before_var),
-            ('cookie_browser',       self.cookie_browser_var),
-            ('cookie_file',          self.cookie_file_var),
-        ]
+    # Widgets — sidebar or Preferences window — bind to these, so a setting
+    # keeps its value while Preferences is closed and _setting_var_map no
+    # longer depends on which panels happen to have been built.
+    _SETTING_VARS = [
+        # (attribute,           settings key)
+        ('fmt_preset_var',      'format_preset'),
+        ('compat_var',          'compat_mode'),
+        ('custom_fmt_var',      'custom_format'),
+        ('audio_extract_var',   'audio_extract'),
+        ('audio_fmt_var',       'audio_format'),
+        ('audio_q_var',         'audio_quality'),
+        ('audio_norm_var',      'audio_normalize'),
+        ('audio_sr_var',        'audio_sample_rate'),
+        ('keep_video_var',      'keep_video'),
+        ('music_tags_var',      'music_tags'),
+        ('outdir_var',          'output_dir'),
+        ('tmpl_var',            'output_template'),
+        ('tmpl_preset_var',     'template_preset'),
+        ('archive_var',         'archive_enabled'),
+        ('archive_file_var',    'archive_file'),
+        ('embed_thumb_var',     'embed_thumbnail'),
+        ('write_thumb_var',     'write_thumbnail'),
+        ('embed_meta_var',      'embed_metadata'),
+        ('write_json_var',      'write_infojson'),
+        ('write_subs_var',      'write_subs'),
+        ('auto_subs_var',       'auto_subs'),
+        ('embed_subs_var',      'embed_subs'),
+        ('sub_langs_var',       'sub_langs'),
+        ('sub_convert_var',     'sub_convert'),
+        ('sb_var',              'sponsorblock_enabled'),
+        ('sb_cats_var',         'sponsorblock_cats'),
+        ('sb_mode_var',         'sponsorblock_mode'),
+        ('clip_start_var',      'clip_start'),
+        ('clip_end_var',        'clip_end'),
+        ('clip_precise_var',    'clip_precise'),
+        ('split_chapters_var',  'split_chapters'),
+        ('rate_limit_var',      'rate_limit'),
+        ('proxy_var',           'proxy'),
+        ('retries_var',         'retries'),
+        ('concurrent_var',      'concurrent_fragments'),
+        ('max_conc_var',        'max_concurrent'),
+        ('no_playlist_var',     'no_playlist'),
+        ('maxfs_var',           'max_filesize'),
+        ('date_after_var',      'date_after'),
+        ('date_before_var',     'date_before'),
+        ('cookie_browser_var',  'cookie_browser'),
+        ('cookie_file_var',     'cookie_file'),
+    ]
 
+    def _create_setting_vars(self):
+        """Build every download-tab Var up front. Type follows the default."""
+        for attr, key in self._SETTING_VARS:
+            default = DEFAULT_SETTINGS[key]
+            cls = tk.BooleanVar if isinstance(default, bool) else tk.StringVar
+            setattr(self, attr, cls(value=self.settings.get(key, default)))
+        # Lives on the Var, not on a panel: the template box is in Preferences
+        # and the layout dropdown is in the sidebar, so either can change it and
+        # both need the dropdown/preview kept in sync.
+        # The flag stops a programmatic write (layout dropdown -> template) from
+        # bouncing the dropdown straight back to "Custom…".
+        self._suppress_tmpl_trace = False
+        self.tmpl_var.trace_add('write', self._on_template_edited)
+
+    def _setting_var_map(self) -> list:
+        """(settings_key, tk_var) for every download-tab setting."""
+        return [(key, getattr(self, attr)) for attr, key in self._SETTING_VARS]
     def _collect_settings(self) -> dict:
         for key, var in self._setting_var_map():
             self.settings[key] = var.get()
@@ -2317,7 +2097,7 @@ class App(tk.Tk):
 
     def _start_conversions(self):
         if not self._ffmpeg_path:
-            self._log('[ERR]  FFmpeg not found. Set its path in ⚙ Settings.\n', 'red')
+            self._log('[ERR]  FFmpeg not found. Set its path in Preferences → Tools.\n', 'red')
             return
         s = self._collect_conv_settings()
         fmt = s['conv_output_format']
