@@ -50,6 +50,15 @@ These bit us once; re-check before changing `_build_ydl_opts`:
 - Postprocessor **order matters** and must mirror `yt_dlp/__init__.py: get_postprocessors`: SponsorBlock (`when='after_filter'`) → ExtractAudio → EmbedSubtitle → ModifyChapters → FFmpegMetadata → EmbedThumbnail.
 - Prefer `merge_output_format='mp4/mkv'` over `'mp4'`. With a single preference `get_compatible_ext` force-returns it even for codecs the container can't hold (VP9/Opus in MP4); the `/mkv` fallback keeps the file valid.
 - Resolution caps use format **sorting** (`format_sort=['res:720']`), not a `[height<=720]` filter. The filter makes the download fail outright when every available format exceeds the cap.
+- `download_ranges` takes a `download_range_func([], [(start, end)])` callable, not a plain tuple. Pair it with `force_keyframes_at_cuts` or cuts snap to the nearest keyframe.
+
+## FFmpeg gotchas (verified against ffmpeg 8.1)
+
+- Audio targets need `-vn`, or an M4A/AAC/OGG/ALAC conversion of a video file keeps and re-encodes the picture.
+- H.264/HEVC/VP9 targets need an explicit `-pix_fmt yuv420p`; encoders otherwise inherit a 10-bit or 4:2:2 source format that most players and hardware decoders reject.
+- `dnxhd` refuses to encode without `-profile:v`; ProRes needs the pixel format its profile expects (`yuva444p10le` for 4444, `yuv422p10le` otherwise). See `CONV_INTRA_PROFILES`.
+- Scale filters use `w='min(iw,N)'` so "Resize" only ever downscales.
+- Trim: `-ss` goes **before** `-i` (seek instead of decode-and-discard); `-t` after `-i` is a *duration* relative to the trimmed start, not an absolute timestamp. `_effective_duration` adjusts the progress denominator to match.
 - **Mouse-wheel routing** — `_wheel_target` plus `_bind_scroll_on` recursively bind `<Enter>/<Leave>` so the wheel scrolls whichever canvas the cursor is over. Any new scrollable area must call `_bind_scroll_on(widget, canvas)`.
 - **Settings persistence** — JSON written to [gui_settings.json](gui_settings.json) on save and on app `destroy()`. Schema is defined by `DEFAULT_SETTINGS`; missing keys are filled in on load via dict-merge.
 - **FFmpeg resolution** — `find_ffmpeg()` checks PATH then known install dirs (Scoop, Choco, Winget, project-local). The settings dialog lets the user override with an explicit path. The status badge in the header reflects the resolved value.
