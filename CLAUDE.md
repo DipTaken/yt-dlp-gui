@@ -30,13 +30,26 @@ The PyInstaller spec ([YouTube Downloader.spec](YouTube%20Downloader.spec)) is r
 
 A single `App(tk.Tk)` class holds the entire UI. Key pieces:
 
-- **Constants block** ([gui.py:31-176](gui.py#L31-L176)) — Catppuccin Mocha palette, FFmpeg search paths, `FORMAT_PRESETS`, converter format table (`CONV_FORMAT_INFO`), and `DEFAULT_SETTINGS`.
-- **`DownloadItem`** ([gui.py:206](gui.py#L206)) and **`ConvItem`** ([gui.py:248](gui.py#L248)) — plain state objects per queue row, with status enums and a `threading.Event` cancel flag.
-- **`_GUILogger`** ([gui.py:182](gui.py#L182)) — adapter that pipes yt-dlp log output into the GUI message queue.
-- **Threading model** — every download/conversion runs in its own daemon `Thread`. Workers push status updates onto `self.msg_q` (a `queue.Queue`); the Tk main loop drains it in `_poll()` ([gui.py:1427](gui.py#L1427)) every 80 ms. **Never touch tk widgets from a worker thread — always go through `msg_q`.**
+- **Constants block** — Catppuccin Mocha palette, FFmpeg search paths, `FORMAT_PRESETS`, `COMPAT_MODES`, converter format table (`CONV_FORMAT_INFO`), and `DEFAULT_SETTINGS`.
+- **`DownloadItem`** and **`ConvItem`** — plain state objects per queue row, with status enums and a `threading.Event` cancel flag. `DownloadItem.STARTABLE` / `.ACTIVE` are the canonical status groupings; use them instead of listing statuses inline.
+- **`_GUILogger`** — adapter that pipes yt-dlp log output into the GUI message queue. Its `error()` only *records* text (`note_error`); the worker's return value decides the final status, because yt-dlp logs errors for recoverable situations too.
+- **Threading model** — every download/conversion runs in its own daemon `Thread`, gated by a `threading.Semaphore` (`_download_slot()` / `_conversion_slot()`) so a large queue can't spawn unbounded workers. Workers push status updates onto `self.msg_q` (a `queue.Queue`); the Tk main loop drains it in `_poll()` every 80 ms. **Never touch tk widgets from a worker thread — always go through `msg_q`.** Messages carry only plain scalars, never yt-dlp's live `info_dict`.
+- **Cancellation** — setting the item's event is not enough. `_make_progress_hook` / `_make_pp_hook` raise `yt_dlp.utils.DownloadCancelled`, which is the only way to abort an in-flight yt-dlp download; the worker catches it and marks the item CANCELLED.
 - **Two tabs**:
-  - **Downloader** — queue panel ([_build_queue_panel](gui.py#L598)) + settings panel ([_populate_settings](gui.py#L696)). Download pipeline: `_collect_settings` → `_build_ydl_opts` → `_download_worker`.
-  - **Converter** — local-file ffmpeg transcoder ([_build_converter_tab](gui.py#L1633)). Spawns `ffmpeg` as a subprocess, parses `time=HH:MM:SS.ms` from stderr to drive the progress bar.
+  - **Downloader** — queue panel (`_build_queue_panel`) + settings panel (`_populate_settings`). Download pipeline: `_collect_settings` → `_build_ydl_opts` → `_download_worker`. `_build_ydl_opts` delegates to `_build_format_opts` (selector + codec/container policy) and `_build_postprocessors` (the PP chain).
+  - **Converter** — local-file ffmpeg transcoder (`_build_converter_tab`). Spawns `ffmpeg` as a subprocess and parses `time=HH:MM:SS.ms` from stderr. Read stderr via `_iter_ffmpeg_chunks`, **not** line-by-line: ffmpeg rewrites its progress line with `\r`, so `for line in proc.stderr` yields nothing until the process exits.
+
+## yt-dlp option gotchas (verified against the vendored tree)
+
+These bit us once; re-check before changing `_build_ydl_opts`:
+
+- `ratelimit` and `max_filesize` are **byte counts**, not strings — run UI text through `parse_bytes`.
+- Date filters go in a single `daterange=DateRange(after, before)`. `dateafter`/`datebefore` are CLI-only names that `YoutubeDL` never reads.
+- `postprocessor_args` keys are looked up **lower-cased and without the `FFmpeg` prefix** (`extractaudio`, not `FFmpegExtractAudio`) — a wrong key fails silently.
+- `EmbedThumbnail` needs `writethumbnail=True`; the CLI force-enables it, the Python API does not.
+- Postprocessor **order matters** and must mirror `yt_dlp/__init__.py: get_postprocessors`: SponsorBlock (`when='after_filter'`) → ExtractAudio → EmbedSubtitle → ModifyChapters → FFmpegMetadata → EmbedThumbnail.
+- Prefer `merge_output_format='mp4/mkv'` over `'mp4'`. With a single preference `get_compatible_ext` force-returns it even for codecs the container can't hold (VP9/Opus in MP4); the `/mkv` fallback keeps the file valid.
+- Resolution caps use format **sorting** (`format_sort=['res:720']`), not a `[height<=720]` filter. The filter makes the download fail outright when every available format exceeds the cap.
 - **Mouse-wheel routing** — `_wheel_target` plus `_bind_scroll_on` recursively bind `<Enter>/<Leave>` so the wheel scrolls whichever canvas the cursor is over. Any new scrollable area must call `_bind_scroll_on(widget, canvas)`.
 - **Settings persistence** — JSON written to [gui_settings.json](gui_settings.json) on save and on app `destroy()`. Schema is defined by `DEFAULT_SETTINGS`; missing keys are filled in on load via dict-merge.
 - **FFmpeg resolution** — `find_ffmpeg()` checks PATH then known install dirs (Scoop, Choco, Winget, project-local). The settings dialog lets the user override with an explicit path. The status badge in the header reflects the resolved value.

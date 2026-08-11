@@ -23,7 +23,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import format_bytes
+from yt_dlp.utils import DateRange, DownloadCancelled, format_bytes, parse_bytes
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Catppuccin Mocha palette
@@ -91,19 +91,63 @@ def find_ffmpeg() -> str:
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 SETTINGS_FILE = os.path.join(ROOT, 'gui_settings.json')
-SETTINGS_SCHEMA_VERSION = 1
+SETTINGS_SCHEMA_VERSION = 2
 
-FORMAT_PRESETS = {
-    'Best (Video + Audio)': 'bestvideo+bestaudio/best',
-    'Best MP4':             'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-    '4K (2160p)':           'bestvideo[height<=2160]+bestaudio/best[height<=2160]',
-    '1080p':                'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]',
-    '720p':                 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]',
-    '480p':                 'bestvideo[height<=480]+bestaudio/best[height<=480]',
-    '360p':                 'bestvideo[height<=360]+bestaudio/best[height<=360]',
-    'Audio Only (Best)':    'bestaudio/best',
-    'Custom…':              '',
+# Resolution caps are expressed through yt-dlp's format *sorting* (`-S res:N`)
+# rather than through a `[height<=N]` filter. A filter makes the download fail
+# outright ("Requested format is not available") when every available format is
+# above the cap; sorting instead picks the closest match and always succeeds.
+#
+#   label -> (format selector, height cap or None)
+FORMAT_PRESETS: dict[str, tuple[str, 'int | None']] = {
+    'Best (Video + Audio)': ('bv*+ba/b',  None),
+    '4K (2160p)':           ('bv*+ba/b',  2160),
+    '1440p':                ('bv*+ba/b',  1440),
+    '1080p':                ('bv*+ba/b',  1080),
+    '720p':                 ('bv*+ba/b',  720),
+    '480p':                 ('bv*+ba/b',  480),
+    '360p':                 ('bv*+ba/b',  360),
+    'Audio Only (Best)':    ('ba/b',      None),
+    'Custom…':              ('',          None),
 }
+
+# Codec/container policy. `sort` fields are prepended to yt-dlp's default format
+# ordering; `merge` is passed as --merge-output-format.
+#
+# 'mp4/mkv' (rather than plain 'mp4') matters: with a single preference yt-dlp
+# will force the container even when the codecs don't fit it, producing e.g.
+# VP9+Opus inside .mp4 — a file most players choke on. The '/mkv' fallback lets
+# it pick a container that can actually hold the streams.
+COMPAT_MODES: dict[str, dict] = {
+    'Compatible (H.264 / AAC / MP4)': {
+        'sort':  ['vcodec:h264', 'acodec:aac', 'ext:mp4:m4a'],
+        'merge': 'mp4/mkv',
+        'help':  'Plays everywhere (Windows Media Player, QuickTime, editors, '
+                 'phones, TVs). Caps out at 1080p on YouTube, which serves '
+                 'higher resolutions only as VP9/AV1.',
+    },
+    'Balanced (best resolution, MP4 if possible)': {
+        'sort':  ['res', 'vcodec:h264', 'acodec:aac', 'ext:mp4:m4a'],
+        'merge': 'mp4/mkv',
+        'help':  'Highest resolution available, preferring H.264/AAC at that '
+                 'resolution. Falls back to .mkv when the codecs cannot go in '
+                 'an MP4 container.',
+    },
+    'Max quality (any codec, MKV)': {
+        'sort':  [],
+        'merge': 'mkv',
+        'help':  'Whatever yt-dlp rates highest (often AV1/VP9 + Opus), always '
+                 'in Matroska. Best quality per byte; needs VLC/mpv or a recent '
+                 'player.',
+    },
+    'yt-dlp default (no override)': {
+        'sort':  [],
+        'merge': '',
+        'help':  'No container or codec preference at all — yt-dlp decides, '
+                 'which may yield .webm or .mkv.',
+    },
+}
+DEFAULT_COMPAT_MODE = 'Balanced (best resolution, MP4 if possible)'
 
 SB_CATEGORIES = ['all', 'sponsor', 'intro', 'outro', 'selfpromo',
                   'interaction', 'music_offtopic', 'preview', 'filler']
@@ -131,30 +175,49 @@ CONV_PRESETS: dict[str, tuple[str, str, str, str]] = {
 }
 
 # (base_ffmpeg_args, kind, output_ext)
+#
+# Notes on the args below:
+#  · Audio targets get `-vn` at build time. Verified against ffmpeg 8.1: without
+#    it, an M4A/AAC/OGG/ALAC "audio" conversion of a video file keeps the video
+#    stream and re-encodes it, so the result is a video file wearing an audio
+#    extension. (MP3/WAV/FLAC/Opus happened to drop it on their own.)
+#  · H.264 targets pin `-pix_fmt yuv420p`. libx264 otherwise inherits the
+#    source's pixel format, so a 10-bit or 4:2:2 input yields High 4:2:2 10-bit
+#    output that most hardware decoders and players refuse — verified: the old
+#    args turned a yuv422p10le source into a yuv422p10le MP4.
+#  · `-sn -dn` on video targets is defensive; ffmpeg dropped incompatible
+#    subtitle streams on its own in testing, but being explicit costs nothing.
+#  · AVI uses `libmp3lame` rather than `mp3` for explicitness — the bare `mp3`
+#    alias does resolve on current ffmpeg builds, so this is a clarity change.
 CONV_FORMAT_INFO: dict[str, tuple[list, str, str]] = {
-    'MP3':              (['-c:a', 'libmp3lame'],                              'audio', 'mp3'),
+    'MP3':              (['-c:a', 'libmp3lame'],                             'audio', 'mp3'),
     'WAV':              (['-c:a', 'pcm_s16le'],                              'audio', 'wav'),
     'FLAC':             (['-c:a', 'flac'],                                   'audio', 'flac'),
     'AAC':              (['-c:a', 'aac'],                                    'audio', 'm4a'),
-    'M4A':              (['-c:a', 'aac', '-movflags', 'faststart'],          'audio', 'm4a'),
+    'M4A':              (['-c:a', 'aac', '-movflags', '+faststart'],         'audio', 'm4a'),
     'OGG':              (['-c:a', 'libvorbis'],                              'audio', 'ogg'),
     'Opus':             (['-c:a', 'libopus'],                                'audio', 'opus'),
-    'ALAC':             (['-c:a', 'alac', '-movflags', 'faststart'],         'audio', 'm4a'),
-    'MP4 (H.264)':      (['-c:v', 'libx264', '-c:a', 'aac',
-                          '-movflags', '+faststart'],                         'video', 'mp4'),
-    'MP4 (H.265/HEVC)': (['-c:v', 'libx265', '-c:a', 'aac',
-                          '-movflags', '+faststart'],                         'video', 'mp4'),
-    'MKV':              (['-c:v', 'libx264', '-c:a', 'aac'],                'video', 'mkv'),
-    'WebM':             (['-c:v', 'libvpx-vp9', '-b:v', '0', '-c:a',
-                          'libopus'],                                         'video', 'webm'),
-    'MOV':              (['-c:v', 'libx264', '-c:a', 'aac'],                'video', 'mov'),
-    'AVI':              (['-c:v', 'libx264', '-c:a', 'mp3'],                'video', 'avi'),
+    'ALAC':             (['-c:a', 'alac', '-movflags', '+faststart'],        'audio', 'm4a'),
+    'MP4 (H.264)':      (['-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                          '-c:a', 'aac', '-movflags', '+faststart'],         'video', 'mp4'),
+    'MP4 (H.265/HEVC)': (['-c:v', 'libx265', '-pix_fmt', 'yuv420p',
+                          '-tag:v', 'hvc1',
+                          '-c:a', 'aac', '-movflags', '+faststart'],         'video', 'mp4'),
+    'MKV':              (['-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                          '-c:a', 'aac'],                                    'video', 'mkv'),
+    'WebM':             (['-c:v', 'libvpx-vp9', '-b:v', '0',
+                          '-c:a', 'libopus'],                                'video', 'webm'),
+    'MOV':              (['-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                          '-c:a', 'aac'],                                    'video', 'mov'),
+    'AVI':              (['-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                          '-c:a', 'libmp3lame'],                             'video', 'avi'),
 }
 
 DEFAULT_SETTINGS = {
     'output_dir':           str(Path.home() / 'Downloads'),
     'output_template':      '%(title)s [%(id)s].%(ext)s',
     'format_preset':        'Best (Video + Audio)',
+    'compat_mode':          DEFAULT_COMPAT_MODE,
     'custom_format':        '',
     'audio_extract':        False,
     'audio_format':         'mp3',
@@ -175,6 +238,7 @@ DEFAULT_SETTINGS = {
     'proxy':                '',
     'retries':              '3',
     'concurrent_fragments': '4',
+    'max_concurrent':       '3',
     'no_playlist':          False,
     'max_filesize':         '',
     'date_after':           '',
@@ -216,7 +280,10 @@ class _GUILogger:
 
     def error(self, msg):
         self._q.put(('log', '[ERR]  ' + msg.rstrip('\n') + '\n', 'red'))
-        self._q.put(('set_error', self._id, msg.rstrip('\n')))
+        # Record the text only. yt-dlp logs errors for recoverable situations
+        # too (a missing subtitle track, one dead entry in a playlist), so the
+        # worker's return value — not this callback — decides the final status.
+        self._q.put(('note_error', self._id, msg.rstrip('\n')))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,12 +291,18 @@ class _GUILogger:
 # ─────────────────────────────────────────────────────────────────────────────
 class DownloadItem:
     PENDING     = 'pending'
+    QUEUED      = 'queued'       # accepted, waiting for a download slot
     FETCHING    = 'fetching'
     DOWNLOADING = 'downloading'
     CONVERTING  = 'converting'
     DONE        = 'done'
     ERROR       = 'error'
     CANCELLED   = 'cancelled'
+
+    # States from which a fresh download may be started.
+    STARTABLE = (PENDING,)
+    # States where a worker thread may still be running.
+    ACTIVE    = (QUEUED, FETCHING, DOWNLOADING, CONVERTING)
 
     def __init__(self, url: str):
         self.id       = uuid.uuid4().hex[:8]
@@ -242,7 +315,9 @@ class DownloadItem:
         self.size_str = ''
         self.error    = ''
         self._cancel  = threading.Event()
-        self._format_override: str = ''  # specific format_id from info popup
+        # Explicit format selector chosen in the info popup. Already a complete
+        # yt-dlp selector (e.g. '137+bestaudio/137'), not a bare format_id.
+        self.format_override: str = ''
 
     def cancel(self):
         self._cancel.set()
@@ -312,6 +387,11 @@ class App(tk.Tk):
         self.items: dict[str, DownloadItem] = {}
         self.msg_q: queue.Queue = queue.Queue()
         self._threads: dict[str, threading.Thread] = {}
+        self._dl_slot: 'threading.Semaphore | None' = None
+        self._dl_slot_size = 0
+        self._conv_slot: 'threading.Semaphore | None' = None
+        self._conv_slot_size = 0
+        self._poll_after_id: 'str | None' = None
 
         # Converter state
         self.conv_items: dict[str, ConvItem] = {}
@@ -326,6 +406,10 @@ class App(tk.Tk):
         # One-shot callback for the "Update yt-dlp" worker; set by the
         # settings dialog, consumed once by _handle('update_result').
         self._pending_update_callback = None
+
+        # Throttling state for progress log lines, keyed by item id.
+        self._last_logged_pct: dict[str, float] = {}
+        self._last_status_summary = ''
 
         # Global mousewheel routing (accumulator allows fractional touchpad deltas)
         self._wheel_target: 'tk.Canvas | None' = None
@@ -406,7 +490,17 @@ class App(tk.Tk):
         # v0 → v1: no field renames yet; just record the new version.
         if from_version < 1:
             from_version = 1
-        # Future: if from_version < 2: ...
+        # v1 → v2: format presets no longer encode container/codec preferences —
+        # that moved to the separate `compat_mode` setting. The old 'Best MP4'
+        # preset becomes "Best" + the compatible codec policy.
+        if from_version < 2:
+            if data.get('format_preset') == 'Best MP4':
+                data['format_preset'] = 'Best (Video + Audio)'
+                data.setdefault('compat_mode', 'Compatible (H.264 / AAC / MP4)')
+            if data.get('format_preset') not in FORMAT_PRESETS:
+                data['format_preset'] = DEFAULT_SETTINGS['format_preset']
+            from_version = 2
+        # Future: if from_version < 3: ...
         return data
 
     def _save_settings(self):
@@ -428,6 +522,7 @@ class App(tk.Tk):
             var.set(DEFAULT_SETTINGS[key])
         # Refresh dependent sub-frames
         self._on_format_change()
+        self._on_compat_change()
         self._on_audio_toggle()
         self._on_sb_toggle()
         self._collect_settings()
@@ -852,15 +947,35 @@ class App(tk.Tk):
         # ── FORMAT ───────────────────────────────────────────────────────────
         body = self._sec(inner, 'FORMAT')
         self.fmt_preset_var = tk.StringVar(value=self.settings['format_preset'])
-        self._labeled_combo(body, 'Format Preset',
-                            self.fmt_preset_var, list(FORMAT_PRESETS.keys()),
-                            on_select=self._on_format_change)
+        preset_anchor = self._labeled_combo(
+            body, 'Format Preset',
+            self.fmt_preset_var, list(FORMAT_PRESETS.keys()),
+            on_select=self._on_format_change)
 
         self._custom_fmt_frame = tk.Frame(body, bg=MANTLE)
+        self._custom_fmt_anchor = preset_anchor
         tk.Label(self._custom_fmt_frame, text='Custom Format String',
                  bg=MANTLE, fg=SUBT0, font=('Segoe UI', 9)).pack(anchor='w')
         self.custom_fmt_var = tk.StringVar(value=self.settings['custom_format'])
         self._entry(self._custom_fmt_frame, self.custom_fmt_var).pack(fill='x', pady=(2, 0), ipady=4)
+        tk.Label(self._custom_fmt_frame,
+                 text='Raw yt-dlp -f selector. Codec/container preference below '
+                      'is not applied to custom selectors.',
+                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
+                 wraplength=330, justify='left').pack(anchor='w', pady=(2, 0))
+
+        # Codec / container policy — the knob that decides whether you get a
+        # universally-playable MP4 or a higher-quality AV1/Opus MKV.
+        self.compat_var = tk.StringVar(value=self.settings['compat_mode'])
+        self._compat_anchor = self._labeled_combo(
+            body, 'Codec / Container Preference',
+            self.compat_var, list(COMPAT_MODES.keys()),
+            on_select=self._on_compat_change)
+        self._compat_help = tk.Label(body, text='', bg=MANTLE, fg=SURF2,
+                                     font=('Segoe UI', 8), wraplength=330,
+                                     justify='left')
+        self._compat_help.pack(anchor='w', padx=16, pady=(0, 2))
+        self._on_compat_change()
 
         self.audio_extract_var = tk.BooleanVar(value=self.settings['audio_extract'])
         ttk.Checkbutton(body, text='Extract Audio Only',
@@ -890,10 +1005,8 @@ class App(tk.Tk):
         ttk.Checkbutton(self._audio_opts_frame, text='Normalize Audio Volume (FFmpeg loudnorm)',
                         variable=self.audio_norm_var).pack(anchor='w', pady=(4, 0))
 
-        if self.settings['format_preset'] == 'Custom…':
-            self._custom_fmt_frame.pack(fill='x', **P)
-        if self.settings['audio_extract']:
-            self._audio_opts_frame.pack(fill='x', **P)
+        self._on_format_change()
+        self._on_audio_toggle()
 
         # ── OUTPUT ───────────────────────────────────────────────────────────
         body = self._sec(inner, 'OUTPUT')
@@ -938,15 +1051,19 @@ class App(tk.Tk):
         # ── SPONSORBLOCK ──────────────────────────────────────────────────────
         body = self._sec(inner, 'SPONSORBLOCK')
         self.sb_var = tk.BooleanVar(value=self.settings['sponsorblock_enabled'])
-        ttk.Checkbutton(body, text='Enable SponsorBlock',
-                        variable=self.sb_var,
-                        command=self._on_sb_toggle).pack(anchor='w', **P)
+        sb_chk = ttk.Checkbutton(body, text='Enable SponsorBlock',
+                                 variable=self.sb_var,
+                                 command=self._on_sb_toggle)
+        sb_chk.pack(anchor='w', **P)
+        self._sb_anchor = sb_chk
         self._sb_frame = tk.Frame(body, bg=MANTLE)
         self.sb_cats_var = tk.StringVar(value=self.settings['sponsorblock_cats'])
         self._labeled_combo(self._sb_frame, 'Categories to Mark',
                             self.sb_cats_var, SB_CATEGORIES)
-        if self.settings['sponsorblock_enabled']:
-            self._sb_frame.pack(fill='x', **P)
+        tk.Label(self._sb_frame,
+                 text='Segments are marked as chapters, not removed.',
+                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8)).pack(anchor='w', padx=16)
+        self._on_sb_toggle()
 
         # ── NETWORK ───────────────────────────────────────────────────────────
         body = self._sec(inner, 'NETWORK')
@@ -957,11 +1074,14 @@ class App(tk.Tk):
         self._labeled_entry(body, 'Rate Limit (e.g. 2M, 500K — blank = unlimited)',
                             self.rate_limit_var, width=14)
         self._labeled_entry(body, 'Proxy (http://… or socks5://…)', self.proxy_var)
+        self.max_conc_var = tk.StringVar(value=self.settings['max_concurrent'])
         rn = tk.Frame(body, bg=MANTLE)
         rn.pack(fill='x', **P)
         self._mini_entry(rn, 'Retries',               self.retries_var,    width=6)
-        tk.Frame(rn, bg=MANTLE, width=16).pack(side='left')
-        self._mini_entry(rn, 'Concurrent Fragments',  self.concurrent_var, width=6)
+        tk.Frame(rn, bg=MANTLE, width=12).pack(side='left')
+        self._mini_entry(rn, 'Concurrent Frags',      self.concurrent_var, width=6)
+        tk.Frame(rn, bg=MANTLE, width=12).pack(side='left')
+        self._mini_entry(rn, 'Parallel Downloads',    self.max_conc_var,   width=6)
 
         # ── COOKIES & AUTH ────────────────────────────────────────────────────
         body = self._sec(inner, 'COOKIES & AUTH')
@@ -1088,7 +1208,10 @@ class App(tk.Tk):
                 body.pack_forget()
                 chev.configure(text='▸  ')
             else:
-                body.pack(fill='x')
+                # `after=hdr` is essential: a bare pack() appends the body at the
+                # end of the panel, so collapsing then re-expanding a section
+                # teleported it to the bottom of the settings list.
+                body.pack(fill='x', after=hdr)
                 chev.configure(text='▾  ')
             state['open'] = not state['open']
 
@@ -1108,6 +1231,7 @@ class App(tk.Tk):
             anchor='w', padx=16, pady=2)
 
     def _labeled_combo(self, parent, label, var, values, on_select=None):
+        """Returns the wrapper frame so callers can use it as a pack anchor."""
         f = tk.Frame(parent, bg=MANTLE)
         f.pack(fill='x', padx=16, pady=3)
         tk.Label(f, text=label, bg=MANTLE, fg=SUBT0,
@@ -1117,6 +1241,7 @@ class App(tk.Tk):
         cb.pack(fill='x', pady=(2, 0))
         if on_select:
             cb.bind('<<ComboboxSelected>>', on_select)
+        return f
 
     def _labeled_entry(self, parent, label, var, width=None):
         f = tk.Frame(parent, bg=MANTLE)
@@ -1161,21 +1286,43 @@ class App(tk.Tk):
                   activebackground=SURF2).pack(side='left', padx=(4, 0))
 
     # ─── Toggle handlers ──────────────────────────────────────────────────────
+    # Each of these re-shows a frame with an explicit `after=` anchor. Without
+    # one, pack() appends to the end of the parent, so toggling any of these
+    # options shuffled the settings panel into a different order.
     def _on_format_change(self, _e=None):
-        if self.fmt_preset_var.get() == 'Custom…':
-            self._custom_fmt_frame.pack(fill='x', padx=16, pady=3)
+        preset = self.fmt_preset_var.get()
+        if preset == 'Custom…':
+            self._custom_fmt_frame.pack(fill='x', padx=16, pady=3,
+                                        after=self._custom_fmt_anchor)
         else:
             self._custom_fmt_frame.pack_forget()
+        # A raw selector and "audio only" both bypass the codec policy, so hide
+        # the control rather than let it imply an effect it does not have.
+        bypassed = preset == 'Custom…' or self.audio_extract_var.get()
+        if bypassed:
+            self._compat_anchor.pack_forget()
+            self._compat_help.pack_forget()
+        else:
+            self._compat_anchor.pack(fill='x', padx=16, pady=3,
+                                     after=self._custom_fmt_anchor)
+            self._compat_help.pack(anchor='w', padx=16, pady=(0, 2),
+                                   after=self._compat_anchor)
+
+    def _on_compat_change(self, _e=None):
+        mode = COMPAT_MODES.get(self.compat_var.get())
+        self._compat_help.configure(text=mode['help'] if mode else '')
 
     def _on_audio_toggle(self):
         if self.audio_extract_var.get():
             self._audio_opts_frame.pack(fill='x', padx=16, pady=3)
         else:
             self._audio_opts_frame.pack_forget()
+        self._on_format_change()
 
     def _on_sb_toggle(self):
         if self.sb_var.get():
-            self._sb_frame.pack(fill='x', padx=16, pady=3)
+            self._sb_frame.pack(fill='x', padx=16, pady=3,
+                                after=self._sb_anchor)
         else:
             self._sb_frame.pack_forget()
 
@@ -1193,13 +1340,36 @@ class App(tk.Tk):
             self.cookie_file_var.set(path)
 
     # ─── URL input ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _split_urls(raw: str) -> list:
+        """Split pasted input into URLs.
+
+        Splits on whitespace/newlines. Commas are only treated as separators
+        when every resulting piece looks like its own URL — a blanket
+        `replace(',', '\\n')` mangled query strings that legitimately contain
+        commas (YouTube `list=`, timestamps, many CDN signatures).
+        """
+        tokens = [t.strip() for t in raw.split() if t.strip()]
+        out: list = []
+        for tok in tokens:
+            if ',' in tok:
+                parts = [p.strip() for p in tok.split(',') if p.strip()]
+                if len(parts) > 1 and all(
+                        re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', p) for p in parts):
+                    out.extend(parts)
+                    continue
+            out.append(tok)
+        return out
+
     def _add_urls(self):
         if self._url_is_placeholder:
             return
         raw = self.url_var.get().strip()
         if not raw:
             return
-        urls = [u.strip() for u in raw.replace(',', '\n').split('\n') if u.strip()]
+        urls = self._split_urls(raw)
+        if not urls:
+            return
         for url in urls:
             item = DownloadItem(url)
             self.items[item.id] = item
@@ -1216,21 +1386,49 @@ class App(tk.Tk):
         raw = self.url_var.get().strip()
         if not raw:
             return
+        url = self._split_urls(raw)[0] if self._split_urls(raw) else raw
+        s = self._collect_settings()
+
+        # Reuse the download credentials/network settings. Without these, info
+        # fetching failed on anything age-gated, private or geo-blocked even
+        # though cookies and a proxy were configured for downloads.
+        opts: dict = {'quiet': True, 'no_warnings': True, 'skip_download': True,
+                      'noplaylist': s['no_playlist']}
+        if s['proxy']:
+            opts['proxy'] = s['proxy']
+        if s['cookie_browser']:
+            opts['cookiesfrombrowser'] = (s['cookie_browser'],)
+        if s['cookie_file'] and os.path.isfile(s['cookie_file']):
+            opts['cookiefile'] = s['cookie_file']
+        if self._ffmpeg_path:
+            opts['ffmpeg_location'] = os.path.dirname(self._ffmpeg_path)
+
         self.status_var.set('Fetching info…')
-        threading.Thread(target=self._fetch_info_thread, args=(raw,),
+        threading.Thread(target=self._fetch_info_thread, args=(url, opts),
                          daemon=True).start()
 
-    def _fetch_info_thread(self, url: str):
-        opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
+    def _fetch_info_thread(self, url: str, opts: dict):
         try:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
+                # A playlist/channel URL has no formats of its own — show the
+                # first entry instead of an empty format table.
+                if info and info.get('_type') in ('playlist', 'multi_video'):
+                    entries = [e for e in (info.get('entries') or []) if e]
+                    if not entries:
+                        self.msg_q.put(('status', 'No entries found at that URL.'))
+                        return
+                    self.msg_q.put(('log',
+                        f'Playlist with {len(entries)} entries — showing the first.\n',
+                        'yellow'))
+                    info = ydl.process_ie_result(entries[0], download=False)
             if info:
                 self.msg_q.put(('show_info', info))
             else:
                 self.msg_q.put(('status', 'Could not fetch info.'))
         except Exception as exc:
             self.msg_q.put(('status', f'Fetch error: {exc}'))
+            self.msg_q.put(('log', f'[ERR]  Fetch failed: {exc}\n', 'red'))
 
     # ─── Queue card management ────────────────────────────────────────────────
     _CARD_BG   = SURF0
@@ -1283,7 +1481,7 @@ class App(tk.Tk):
                                font=('Segoe UI', 8), relief='flat', bd=0,
                                padx=6, pady=2, cursor='hand2',
                                activebackground=SURF1, activeforeground=TEXT,
-                               command=lambda: self.items.get(item.id) and self.items[item.id].cancel())
+                               command=lambda iid=item.id: self._cancel_item(iid))
         action_btn.pack(side='right')
 
         wdg = {
@@ -1302,7 +1500,7 @@ class App(tk.Tk):
         # Cancel the item first so any still-running daemon thread stops
         # touching widgets that are about to be destroyed.
         item = self.items.get(item_id)
-        if item and item.status in (DownloadItem.DOWNLOADING, DownloadItem.CONVERTING):
+        if item and item.status in DownloadItem.ACTIVE:
             item.cancel()
         wdg = self._q_widgets.pop(item_id, None)
         if wdg:
@@ -1323,6 +1521,7 @@ class App(tk.Tk):
 
         STATUS_COLORS = {
             DownloadItem.PENDING:     (YELLOW, 'PENDING'),
+            DownloadItem.QUEUED:      (BLUE,   'QUEUED'),
             DownloadItem.FETCHING:    (BLUE,   'FETCHING'),
             DownloadItem.DOWNLOADING: (MAUVE,  'DOWNLOADING'),
             DownloadItem.CONVERTING:  (PEACH,  'CONVERTING'),
@@ -1333,9 +1532,15 @@ class App(tk.Tk):
         col, label = STATUS_COLORS.get(item.status, (SUBT0, item.status.upper()))
         wdg['status_lbl'].configure(text=label, fg=col)
 
-        # Info / error text
-        if item.error:
-            wdg['info_lbl'].configure(text=item.error, fg=RED, wraplength=360)
+        # Info / error text. Only surface the error on a card that actually
+        # failed — otherwise a recoverable warning logged mid-download stayed
+        # painted red under a finished item.
+        if item.error and item.status == DownloadItem.ERROR:
+            wdg['info_lbl'].configure(text=self._trunc(item.error, 220),
+                                      fg=RED, wraplength=360)
+        elif item.status == DownloadItem.QUEUED:
+            wdg['info_lbl'].configure(text='Waiting for a free slot…',
+                                      fg=SUBT0, wraplength=0)
         else:
             parts = [p for p in [item.size_str, item.speed,
                                   f'ETA {item.eta}' if item.eta else ''] if p]
@@ -1366,12 +1571,12 @@ class App(tk.Tk):
                 activebackground=SURF2,
                 command=lambda iid=item.id: self._retry_item(iid))
 
-        elif item.status == DownloadItem.DOWNLOADING:
+        elif item.status in DownloadItem.ACTIVE:
             wdg['action_btn'].configure(
                 text='Cancel', state='normal',
                 bg=wdg['card_bg'], fg=SUBT0,
                 activebackground=SURF1,
-                command=lambda: self.items.get(item.id) and self.items[item.id].cancel())
+                command=lambda iid=item.id: self._cancel_item(iid))
 
     @staticmethod
     def _tint_widgets(card: tk.Widget, color: str):
@@ -1417,9 +1622,21 @@ class App(tk.Tk):
             self.items.pop(iid, None)
 
     def _cancel_all(self):
+        cancelled = 0
         for item in self.items.values():
-            if item.status in (DownloadItem.PENDING, DownloadItem.DOWNLOADING):
+            if item.status in DownloadItem.ACTIVE:
                 item.cancel()
+                cancelled += 1
+        self._log(f'Cancel requested for {cancelled} active download(s).\n', 'yellow')
+
+    def _cancel_item(self, item_id: str):
+        item = self.items.get(item_id)
+        if not item:
+            return
+        item.cancel()
+        wdg = self._q_widgets.get(item_id)
+        if wdg:
+            wdg['action_btn'].configure(text='Cancelling…', state='disabled')
 
     def _retry_item(self, item_id: str):
         item = self.items.get(item_id)
@@ -1437,17 +1654,29 @@ class App(tk.Tk):
                 text='Cancel', state='normal',
                 bg=self._CARD_BG, fg=SUBT0,
                 activebackground=SURF1,
-                command=lambda: item.cancel())
+                command=lambda iid=item_id: self._cancel_item(iid))
             wdg['status_lbl'].configure(text='PENDING', fg=YELLOW)
+        self._last_logged_pct.pop(item_id, None)
         self._start_downloads([item_id])
+
+    @staticmethod
+    def _reveal(path: str):
+        try:
+            if sys.platform == 'win32':
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
+        except Exception:
+            pass
 
     def _open_folder(self):
         path = self.outdir_var.get()
         if os.path.isdir(path):
-            if sys.platform == 'win32':
-                os.startfile(path)
-            else:
-                subprocess.Popen(['xdg-open', path])
+            self._reveal(path)
+        else:
+            self._log(f'Output folder does not exist: {path}\n', 'yellow')
 
     def _clear_log(self):
         self.log_txt.configure(state='normal')
@@ -1459,6 +1688,7 @@ class App(tk.Tk):
         """(settings_key, tk_var) for every download-tab setting bound to a Var."""
         return [
             ('format_preset',        self.fmt_preset_var),
+            ('compat_mode',          self.compat_var),
             ('custom_format',        self.custom_fmt_var),
             ('audio_extract',        self.audio_extract_var),
             ('audio_format',         self.audio_fmt_var),
@@ -1481,6 +1711,7 @@ class App(tk.Tk):
             ('proxy',                self.proxy_var),
             ('retries',              self.retries_var),
             ('concurrent_fragments', self.concurrent_var),
+            ('max_concurrent',       self.max_conc_var),
             ('no_playlist',          self.no_playlist_var),
             ('max_filesize',         self.maxfs_var),
             ('date_after',           self.date_after_var),
@@ -1495,118 +1726,284 @@ class App(tk.Tk):
         self._save_settings()
         return self.settings
 
-    def _build_ydl_opts(self, item: DownloadItem, s: dict) -> dict:
-        # Format — per-item override (from info popup) wins over settings
+    def _warn(self, text: str):
+        """Thread-safe warning into the log strip."""
+        self.msg_q.put(('log', f'[WARN] {text}\n', 'yellow'))
+
+    def _build_format_opts(self, item: DownloadItem, s: dict) -> dict:
+        """Format selector + codec/container policy.
+
+        Returns the subset of ydl_opts governing what gets downloaded and what
+        container it ends up in. Kept separate from _build_ydl_opts so it can be
+        reasoned about (and tested) on its own.
+        """
         preset = s['format_preset']
-        if getattr(item, '_format_override', ''):
-            fmt = item._format_override
-        elif s['audio_extract']:
-            fmt = 'bestaudio/best'
-        elif preset == 'Custom…':
-            fmt = s['custom_format'] or 'bestvideo+bestaudio/best'
-        else:
-            fmt = FORMAT_PRESETS.get(preset, 'bestvideo+bestaudio/best')
+        selector, height_cap = FORMAT_PRESETS.get(
+            preset, FORMAT_PRESETS['Best (Video + Audio)'])
 
-        outtmpl = os.path.join(s['output_dir'],
-                               s['output_template'] or '%(title)s.%(ext)s')
+        audio_only = bool(s['audio_extract']) or preset == 'Audio Only (Best)'
 
-        # Post-processors
-        pp = []
+        if item.format_override:
+            # Chosen explicitly in the info popup; respect it verbatim and skip
+            # every preference below, otherwise sorting could override the pick.
+            return {'format': item.format_override}
+
+        if audio_only:
+            return {'format': 'ba/b', 'format_sort': ['acodec:aac', 'abr']}
+
+        if preset == 'Custom…':
+            custom = (s['custom_format'] or '').strip()
+            if not custom:
+                self._warn('Custom format string is empty — using "bv*+ba/b".')
+                custom = 'bv*+ba/b'
+            # A hand-written selector is an explicit instruction: don't layer a
+            # container preference on top of it.
+            return {'format': custom}
+
+        mode = COMPAT_MODES.get(s.get('compat_mode') or '',
+                                COMPAT_MODES[DEFAULT_COMPAT_MODE])
+        # Resolution cap goes first so it outranks the codec preference; see the
+        # FORMAT_PRESETS comment for why this is a sort field, not a filter.
+        sort = ([f'res:{height_cap}'] if height_cap else []) + list(mode['sort'])
+
+        out: dict = {'format': selector}
+        if sort:
+            out['format_sort'] = sort
+        if mode['merge']:
+            out['merge_output_format'] = mode['merge']
+        return out
+
+    def _build_postprocessors(self, s: dict) -> tuple[list, bool]:
+        """Build the postprocessor chain.
+
+        Order matters and mirrors yt-dlp's own CLI (yt_dlp/__init__.py,
+        get_postprocessors): extract audio → embed subs → modify chapters →
+        metadata → embed thumbnail. Running EmbedThumbnail before FFmpegMetadata
+        (as this file used to) makes the metadata pass remux the file and drop
+        the artwork that was just embedded.
+
+        Returns (postprocessors, needs_thumbnail_download).
+        """
+        pp: list[dict] = []
+        want_thumb_file = bool(s['write_thumbnail'])
+        embed_thumb     = bool(s['embed_thumbnail'])
+        want_subs       = bool(s['write_subs'] or s['auto_subs'])
+        embed_subs      = bool(s['embed_subs'] and want_subs)
+
+        # SponsorBlock queries the API before download so later passes can act
+        # on the chapter data ('after_filter' is what the CLI uses).
+        if s['sponsorblock_enabled']:
+            cats = [c.strip() for c in s['sponsorblock_cats'].split(',') if c.strip()]
+            if not cats or 'all' in cats:
+                cats = ['sponsor', 'intro', 'outro', 'selfpromo',
+                        'interaction', 'music_offtopic', 'preview', 'filler']
+            pp.append({'key': 'SponsorBlock', 'categories': cats,
+                       'when': 'after_filter'})
+
         if s['audio_extract']:
             quality = s['audio_quality']
             if quality == 'best':
-                quality = '0'
+                quality = '0'          # 0 = best VBR for the target encoder
             pp.append({'key': 'FFmpegExtractAudio',
                        'preferredcodec': s['audio_format'],
                        'preferredquality': quality})
-        if s['embed_thumbnail']:
-            pp.append({'key': 'EmbedThumbnail'})
-        if s['embed_metadata']:
-            pp.append({'key': 'FFmpegMetadata', 'add_metadata': True})
-        if s['embed_subs'] and (s['write_subs'] or s['auto_subs']):
-            pp.append({'key': 'FFmpegEmbedSubtitle'})
+
+        if embed_subs:
+            # already_have_subtitle keeps the standalone .srt/.vtt when the user
+            # asked to *save* subtitles as well as embed them.
+            pp.append({'key': 'FFmpegEmbedSubtitle',
+                       'already_have_subtitle': bool(s['write_subs'])})
+
+        # ModifyChapters must precede FFmpegMetadata so the rewritten chapter
+        # list is what gets written into the container.
         if s['sponsorblock_enabled']:
-            parts = [c.strip() for c in s['sponsorblock_cats'].split(',') if c.strip()]
-            if not parts or 'all' in parts:
-                cats_list = ['sponsor', 'intro', 'outro', 'selfpromo',
-                             'interaction', 'music_offtopic', 'preview', 'filler']
-            else:
-                cats_list = parts
-            pp.append({'key': 'SponsorBlock', 'categories': cats_list})
             pp.append({'key': 'ModifyChapters',
                        'sponsorblock_chapter_title': '[SponsorBlock]: %(category_names)l',
-                       'remove_sponsor_segments': [], 'force_keyframes': False})
+                       'remove_sponsor_segments': [],
+                       'remove_ranges': [],
+                       'force_keyframes': False})
+
+        if s['embed_metadata']:
+            pp.append({'key': 'FFmpegMetadata',
+                       'add_metadata': True,
+                       'add_chapters': True})
+
+        if embed_thumb:
+            # already_have_thumbnail=True stops yt-dlp deleting a thumbnail the
+            # user explicitly asked to keep.
+            pp.append({'key': 'EmbedThumbnail',
+                       'already_have_thumbnail': want_thumb_file})
+            # The thumbnail has to be on disk before it can be embedded. yt-dlp's
+            # CLI force-enables this; doing it by hand is required here, and its
+            # absence is why "Embed Thumbnail" alone silently did nothing.
+            want_thumb_file = True
+
+        return pp, want_thumb_file
+
+    def _build_ydl_opts(self, item: DownloadItem, s: dict) -> dict:
+        pp, want_thumb_file = self._build_postprocessors(s)
+
+        template = s['output_template'] or '%(title)s [%(id)s].%(ext)s'
+        if os.path.isabs(template):
+            outtmpl = template          # template already carries its own path
+        else:
+            outtmpl = os.path.join(s['output_dir'], template)
 
         sub_langs = [ln.strip() for ln in s['sub_langs'].split(',') if ln.strip()]
+        want_subs = bool(s['write_subs'] or s['auto_subs'])
+        if want_subs and not sub_langs:
+            sub_langs = ['en']
 
         opts: dict = {
-            'format':            fmt,
             'outtmpl':           outtmpl,
             'postprocessors':    pp,
-            'writethumbnail':    s['write_thumbnail'],
+            'writethumbnail':    want_thumb_file,
             'writeinfojson':     s['write_infojson'],
             'writesubtitles':    s['write_subs'],
             'writeautomaticsub': s['auto_subs'],
-            'subtitleslangs':    sub_langs if (s['write_subs'] or s['auto_subs']) else [],
+            'subtitleslangs':    sub_langs if want_subs else [],
             'noplaylist':        s['no_playlist'],
             'quiet':             True,
             'no_warnings':       False,
             'noprogress':        True,
             'logger':            _GUILogger(self.msg_q, item.id),
-            'progress_hooks':    [lambda d, iid=item.id: self.msg_q.put(('prog', iid, d))],
-            'postprocessor_hooks': [lambda d, iid=item.id: self.msg_q.put(('pp', iid, d))],
+            'progress_hooks':      [self._make_progress_hook(item)],
+            'postprocessor_hooks': [self._make_pp_hook(item)],
         }
+        opts.update(self._build_format_opts(item, s))
 
-        # Audio postprocessor extra args (normalize / sample rate)
+        # Audio postprocessor extra args (normalize / sample rate).
+        # Keys are matched case-insensitively against a *lower-cased* pp key, so
+        # 'FFmpegExtractAudio' — the old value here — never matched anything and
+        # both options were silently discarded.
         if s['audio_extract']:
             pp_extra: list[str] = []
             if s.get('audio_normalize'):
                 pp_extra += ['-af', 'loudnorm']
             if s.get('audio_sample_rate'):
-                pp_extra += ['-ar', s['audio_sample_rate']]
+                pp_extra += ['-ar', str(s['audio_sample_rate'])]
             if pp_extra:
-                opts['postprocessor_args'] = {'FFmpegExtractAudio': pp_extra}
+                opts['postprocessor_args'] = {'extractaudio': pp_extra}
 
         # FFmpeg location
         if self._ffmpeg_path:
             opts['ffmpeg_location'] = os.path.dirname(self._ffmpeg_path)
+        elif pp or opts.get('merge_output_format'):
+            self._warn('FFmpeg not found — merging, audio extraction, '
+                       'thumbnail and subtitle embedding will not work.')
 
+        # ── Numeric / typed options ──────────────────────────────────────────
+        # ratelimit and max_filesize are bytes *numbers* in yt-dlp; handing them
+        # the raw '2M' / '500M' strings from the UI raised a TypeError mid-run.
         if s['rate_limit']:
-            opts['ratelimit'] = s['rate_limit']
+            limit = parse_bytes(s['rate_limit'])
+            if limit:
+                opts['ratelimit'] = limit
+            else:
+                self._warn(f'Could not parse rate limit {s["rate_limit"]!r} — ignoring.')
+        if s['max_filesize']:
+            maxfs = parse_bytes(s['max_filesize'])
+            if maxfs:
+                opts['max_filesize'] = maxfs
+            else:
+                self._warn(f'Could not parse max filesize {s["max_filesize"]!r} — ignoring.')
+
         if s['proxy']:
             opts['proxy'] = s['proxy']
-        try:
-            opts['retries'] = int(s['retries'])
-        except ValueError:
-            pass
-        try:
-            opts['concurrent_fragment_downloads'] = int(s['concurrent_fragments'])
-        except ValueError:
-            pass
-        if s['max_filesize']:
-            opts['max_filesize'] = s['max_filesize']
-        if s['date_after']:
-            opts['dateafter'] = s['date_after']
-        if s['date_before']:
-            opts['datebefore'] = s['date_before']
+
+        retries = self._int_or_none(s['retries'])
+        if retries is not None:
+            opts['retries'] = retries
+            opts['fragment_retries'] = retries
+        frags = self._int_or_none(s['concurrent_fragments'])
+        if frags is not None and frags > 0:
+            opts['concurrent_fragment_downloads'] = frags
+
+        # yt-dlp takes a single DateRange under 'daterange'. The old
+        # 'dateafter'/'datebefore' keys are CLI-only names that YoutubeDL never
+        # reads, so both date filters used to do nothing at all.
+        if s['date_after'] or s['date_before']:
+            try:
+                opts['daterange'] = DateRange(s['date_after'] or None,
+                                              s['date_before'] or None)
+            except Exception as exc:
+                self._warn(f'Invalid date filter ({exc}) — ignoring.')
+
         if s['cookie_browser']:
             opts['cookiesfrombrowser'] = (s['cookie_browser'],)
         if s['cookie_file']:
-            if os.path.exists(s['cookie_file']):
+            if os.path.isfile(s['cookie_file']):
                 opts['cookiefile'] = s['cookie_file']
             else:
-                self.msg_q.put(('log',
-                    f'[WARN] Cookie file not found, ignoring: {s["cookie_file"]}\n',
-                    'yellow'))
+                self._warn(f'Cookie file not found, ignoring: {s["cookie_file"]}')
 
         return opts
 
-    def _download_worker(self, item: DownloadItem, opts: dict):
-        item.status = DownloadItem.DOWNLOADING
-        self.msg_q.put(('update', item))
+    @staticmethod
+    def _int_or_none(value) -> 'int | None':
         try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    # ─── Worker hooks ─────────────────────────────────────────────────────────
+    def _make_progress_hook(self, item: DownloadItem):
+        """Progress hook that also implements cancellation.
+
+        Raising DownloadCancelled from inside a hook is the only way to stop a
+        running yt-dlp download; simply setting a flag (what this app did
+        before) left the transfer running to completion and merely relabelled
+        the card afterwards.
+        """
+        iid = item.id
+
+        def hook(d):
+            if item.is_cancelled:
+                raise DownloadCancelled('Cancelled by user')
+            self.msg_q.put(('prog', iid, {
+                'status':           d.get('status'),
+                'downloaded_bytes': d.get('downloaded_bytes'),
+                'total_bytes':      d.get('total_bytes'),
+                'total_bytes_estimate': d.get('total_bytes_estimate'),
+                'speed':            d.get('speed'),
+                'eta':              d.get('eta'),
+                'title':            (d.get('info_dict') or {}).get('title'),
+                'error':            d.get('error'),
+            }))
+        return hook
+
+    def _make_pp_hook(self, item: DownloadItem):
+        iid = item.id
+
+        def hook(d):
+            if item.is_cancelled:
+                raise DownloadCancelled('Cancelled by user')
+            self.msg_q.put(('pp', iid, {
+                'status':        d.get('status'),
+                'postprocessor': d.get('postprocessor'),
+            }))
+        return hook
+
+    def _download_worker(self, item: DownloadItem, opts: dict, slot: threading.Semaphore):
+        acquired = False
+        try:
+            # Wait for a free download slot without blocking the UI. Polling
+            # rather than a plain acquire() so Cancel works while queued.
+            while not slot.acquire(timeout=0.25):
+                if item.is_cancelled:
+                    item.status = DownloadItem.CANCELLED
+                    return
+            acquired = True
+            if item.is_cancelled:
+                item.status = DownloadItem.CANCELLED
+                return
+
+            item.status = DownloadItem.DOWNLOADING
+            self.msg_q.put(('update', item))
+
             with YoutubeDL(opts) as ydl:
                 ret = ydl.download([item.url])
+
             if item.is_cancelled:
                 item.status = DownloadItem.CANCELLED
             elif ret == 0:
@@ -1614,41 +2011,77 @@ class App(tk.Tk):
                 item.progress = 1.0
                 item.speed    = ''
                 item.eta      = ''
+                item.error    = ''   # clear warnings logged along the way
             else:
                 item.status = DownloadItem.ERROR
                 if not item.error:
                     item.error = 'Download returned non-zero exit code.'
+        except DownloadCancelled:
+            item.status = DownloadItem.CANCELLED
+            item.error  = ''
         except Exception as exc:
             if item.is_cancelled:
                 item.status = DownloadItem.CANCELLED
+                item.error  = ''
             else:
                 item.status = DownloadItem.ERROR
-                if not item.error:
-                    item.error = str(exc)
+                item.error  = str(exc) or item.error or 'Unknown error'
         finally:
+            if acquired:
+                slot.release()
+            item.speed = ''
+            item.eta   = ''
             self.msg_q.put(('update', item))
-            tag = 'green' if item.status == DownloadItem.DONE else 'red'
+            tag = {DownloadItem.DONE: 'green',
+                   DownloadItem.CANCELLED: 'yellow'}.get(item.status, 'red')
             self.msg_q.put(('log', f'[{item.status.upper()}] {item.title}\n', tag))
+
+    def _download_slot(self) -> threading.Semaphore:
+        """Semaphore limiting simultaneous downloads, rebuilt when the setting
+        changes. Unbounded threads used to let 'Download All' on a large queue
+        spawn one yt-dlp session per URL."""
+        want = self._int_or_none(self.settings.get('max_concurrent')) or 3
+        want = max(1, min(want, 16))
+        if self._dl_slot is None or self._dl_slot_size != want:
+            self._dl_slot = threading.Semaphore(want)
+            self._dl_slot_size = want
+        return self._dl_slot
 
     def _start_downloads(self, item_ids: list):
         s = self._collect_settings()
+        slot = self._download_slot()
         started = 0
         for iid in item_ids:
             item = self.items.get(iid)
-            if not item or item.status != DownloadItem.PENDING:
+            if not item or item.status not in DownloadItem.STARTABLE:
                 continue
+            # Claim the item on the main thread *before* spawning. The worker
+            # used to set this itself, so two quick clicks on "Download" both
+            # passed the check and ran the same URL twice.
+            item.status = DownloadItem.QUEUED
+            item.error  = ''
+            self._update_card(item)
             opts = self._build_ydl_opts(item, s)
             t = threading.Thread(target=self._download_worker,
-                                 args=(item, opts), daemon=True)
+                                 args=(item, opts, slot), daemon=True)
             self._threads[iid] = t
             t.start()
             started += 1
         if started:
             self.status_var.set(f'Started {started} download(s)…')
-            self._log(f'Starting {started} download(s).\n', 'yellow')
+            self._log(f'Starting {started} download(s) '
+                      f'(max {self._dl_slot_size} at once).\n', 'yellow')
+        else:
+            # Silence here looked like a crash; say why nothing happened.
+            self._log('Nothing to download — select queued items, or use '
+                      '↺ Retry on finished/failed ones.\n', 'yellow')
+            self.status_var.set('Nothing to start.')
 
     def _download_selected(self):
         ids = [iid for iid, w in self._q_widgets.items() if w['check_var'].get()]
+        if not ids:
+            self._log('No items selected.\n', 'yellow')
+            return
         self._start_downloads(ids)
 
     def _download_all(self):
@@ -1658,11 +2091,20 @@ class App(tk.Tk):
     def _poll(self):
         try:
             while True:
-                self._handle(self.msg_q.get_nowait())
-        except queue.Empty:
-            pass
+                try:
+                    msg = self.msg_q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle(msg)
+                except tk.TclError:
+                    return          # window is going away
+                except Exception as exc:
+                    # One malformed message must not kill the poll loop, or the
+                    # whole UI silently stops updating.
+                    self._log(f'[GUI] {type(exc).__name__}: {exc}\n', 'red')
         finally:
-            self.after(80, self._poll)
+            self._poll_after_id = self.after(80, self._poll)
 
     def _handle(self, msg):
         kind = msg[0]
@@ -1679,28 +2121,39 @@ class App(tk.Tk):
 
             if status == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
-                dl    = d.get('downloaded_bytes', 0)
-                item.progress = (dl / total) if total else 0.0
+                dl    = d.get('downloaded_bytes') or 0
+                item.progress = min(dl / total, 1.0) if total else 0.0
                 spd   = d.get('speed')
                 eta   = d.get('eta')
                 item.speed    = (format_bytes(spd) + '/s') if spd else ''
-                item.eta      = f'{int(eta)}s' if eta else ''
+                item.eta      = self._fmt_eta(eta)
                 item.size_str = (f'{format_bytes(dl)}/{format_bytes(total)}'
                                  if total else format_bytes(dl)) if dl else ''
-                if d.get('info_dict', {}).get('title'):
-                    item.title = d['info_dict']['title']
-                item.status = DownloadItem.DOWNLOADING
+                if d.get('title'):
+                    item.title = d['title']
+                if item.status != DownloadItem.CANCELLED:
+                    item.status = DownloadItem.DOWNLOADING
                 self._update_card(item)
-                pct = f'{item.progress * 100:.1f}%'
-                self._log(f'{self._trunc(item.title, 28)}: {pct}'
-                          f'{" @ " + item.speed if item.speed else ""}'
-                          f'{" ETA " + item.eta if item.eta else ""}\n')
+                # Progress hooks fire many times a second; logging every one
+                # flooded the strip and made the whole app stutter.
+                last = self._last_logged_pct.get(iid, -1.0)
+                pct  = item.progress * 100
+                if pct - last >= 5.0 or last < 0:
+                    self._last_logged_pct[iid] = pct
+                    self._log(f'{self._trunc(item.title, 28)}: {pct:.1f}%'
+                              f'{" @ " + item.speed if item.speed else ""}'
+                              f'{" ETA " + item.eta if item.eta else ""}\n')
 
             elif status == 'finished':
+                self._last_logged_pct.pop(iid, None)
                 item.progress = 1.0
-                item.status   = DownloadItem.CONVERTING
                 item.speed    = ''
                 item.eta      = ''
+                # Fires once per stream, so a merge passes through here between
+                # the video and audio downloads. Never resurrect a cancelled or
+                # already-finished item.
+                if item.status == DownloadItem.DOWNLOADING:
+                    item.status = DownloadItem.CONVERTING
                 self._update_card(item)
 
             elif status == 'error':
@@ -1712,18 +2165,20 @@ class App(tk.Tk):
         elif kind == 'pp':
             _, iid, d = msg
             item = self.items.get(iid)
-            if item and d.get('status') == 'started':
+            if item and d.get('status') == 'started' and item.status in (
+                    DownloadItem.DOWNLOADING, DownloadItem.CONVERTING):
                 item.status   = DownloadItem.CONVERTING
                 item.size_str = f'Post-processing: {d.get("postprocessor", "")}'
                 self._update_card(item)
 
-        elif kind == 'set_error':
+        elif kind == 'note_error':
+            # Remember the message so a genuine failure can show something
+            # useful, but leave the status alone — see _GUILogger.error.
             _, iid, errmsg = msg
             item = self.items.get(iid)
-            if item and item.status != DownloadItem.DONE:
-                item.error  = errmsg
-                item.status = DownloadItem.ERROR
-                self._update_card(item)
+            if item and item.status not in (DownloadItem.DONE,
+                                            DownloadItem.CANCELLED):
+                item.error = errmsg
 
         elif kind == 'status':
             self.status_var.set(msg[1])
@@ -1830,22 +2285,32 @@ class App(tk.Tk):
         tree.tag_configure('audio',    foreground=GREEN)
         tree.tag_configure('combined', foreground=MAUVE)
 
+        # row iid -> ('combined' | 'video' | 'audio'), needed to build a correct
+        # selector when the user picks a row.
+        row_kind: dict[str, str] = {}
         for fmt in reversed(info.get('formats', [])):
             vc   = (fmt.get('vcodec') or 'none')
             ac   = (fmt.get('acodec') or 'none')
             w, h = fmt.get('width'), fmt.get('height')
             res  = f'{w}×{h}' if (w and h) else (fmt.get('format_note', '') or 'audio only')
-            fps  = str(int(fmt.get('fps', 0) or 0)) or ''
+            fps_val = fmt.get('fps') or 0
+            fps  = str(int(fps_val)) if fps_val else ''
             tbr  = fmt.get('tbr')
             fs   = fmt.get('filesize') or fmt.get('filesize_approx')
             has_v = vc not in ('none', 'None', '', None)
             has_a = ac not in ('none', 'None', '', None)
             tag   = 'combined' if (has_v and has_a) else ('video' if has_v else 'audio')
-            tree.insert('', 'end', tags=(tag,),
-                        values=(fmt.get('format_id', ''), fmt.get('ext', ''),
-                                res, fps, vc[:12], ac[:12],
-                                f'{tbr:.0f}k' if tbr else '',
-                                format_bytes(fs) if fs else ''))
+            iid = tree.insert('', 'end', tags=(tag,),
+                              values=(fmt.get('format_id', ''), fmt.get('ext', ''),
+                                      res, fps, vc[:12], ac[:12],
+                                      f'{tbr:.0f}k' if tbr else '',
+                                      format_bytes(fs) if fs else ''))
+            row_kind[iid] = tag
+
+        tk.Label(popup,
+                 text='Blue = video only (audio is merged in automatically)  ·  '
+                      'Green = audio only  ·  Purple = already combined',
+                 bg=BASE, fg=SURF2, font=('Segoe UI', 8)).pack(anchor='w', padx=16)
 
         tsb = ttk.Scrollbar(tf, orient='vertical', command=tree.yview)
         tree.configure(yscrollcommand=tsb.set)
@@ -1869,43 +2334,66 @@ class App(tk.Tk):
 
         url_final = info.get('webpage_url') or info.get('url', '')
 
-        def make_item(format_id: str = '') -> 'DownloadItem | None':
+        def make_item(selector: str = '') -> 'DownloadItem | None':
             if not url_final:
+                self._log('[ERR]  No usable URL in the fetched info.\n', 'red')
                 return None
             new = DownloadItem(url_final)
             new.title = title
+            new.format_override = selector
             self.items[new.id] = new
             self._add_card(new)
             self._q_widgets[new.id]['title_lbl'].configure(
                 text=self._trunc(title, 44))
-            if format_id:
-                new._format_override = format_id
             return new
 
+        def selector_for(row_iid: str) -> str:
+            """Turn a picked table row into a complete yt-dlp selector.
+
+            A bare format_id was used before. For the video-only rows that make
+            up most of the table on YouTube and similar sites, that downloads a
+            silent video — the single most common way this dialog produced a
+            'broken' file. Video-only rows now get audio merged in, with a
+            fallback to the bare id if no audio stream exists.
+            """
+            fid = tree.set(row_iid, 'ID')
+            if not fid:
+                return ''
+            if row_kind.get(row_iid) == 'video':
+                return f'{fid}+bestaudio/{fid}'
+            return fid
+
         def add_to_queue():
-            make_item()
+            sel = tree.selection()
+            make_item(selector_for(sel[0]) if sel else '')
             popup.destroy()
 
         def download_selected_format():
             sel = tree.selection()
             if not sel:
+                self.status_var.set('Pick a format row first.')
                 return
-            fid = tree.set(sel[0], 'ID')
-            if not fid:
+            selector = selector_for(sel[0])
+            if not selector:
                 return
-            item = make_item(fid)
+            item = make_item(selector)
             if item:
                 self._start_downloads([item.id])
             popup.destroy()
 
-        tk.Button(btn_row, text='Add to Queue', command=add_to_queue,
-                  bg=MAUVE, fg=CRUST, activebackground='#b89be6',
-                  font=('Segoe UI', 9, 'bold'), relief='flat', bd=0,
-                  padx=14, pady=6, cursor='hand2').pack(side='left')
+        add_btn = tk.Button(btn_row, text='Add to Queue', command=add_to_queue,
+                            bg=MAUVE, fg=CRUST, activebackground='#b89be6',
+                            font=('Segoe UI', 9, 'bold'), relief='flat', bd=0,
+                            padx=14, pady=6, cursor='hand2')
+        add_btn.pack(side='left')
         tk.Button(btn_row, text='Download Selected Format',
                   command=download_selected_format,
                   bg=SURF0, fg=TEXT, activebackground=SURF1,
                   **_bkw).pack(side='left', padx=(6, 0))
+
+        # Make it obvious that selecting a row changes what "Add" will queue.
+        tree.bind('<<TreeviewSelect>>', lambda _e: add_btn.configure(
+            text='Queue Selected Format' if tree.selection() else 'Add to Queue'))
         tk.Button(btn_row, text='Copy URL',
                   command=lambda: (self.clipboard_clear(),
                                    self.clipboard_append(url_final)),
@@ -2148,10 +2636,9 @@ class App(tk.Tk):
     def _open_conv_folder(self):
         path = self.conv_outdir_var.get()
         if os.path.isdir(path):
-            if sys.platform == 'win32':
-                os.startfile(path)
-            else:
-                subprocess.Popen(['xdg-open', path])
+            self._reveal(path)
+        else:
+            self._log(f'Output folder does not exist: {path}\n', 'yellow')
 
     # ── Conv card management ──────────────────────────────────────────────────
     _CONV_CARD_BG  = SURF0
@@ -2314,67 +2801,168 @@ class App(tk.Tk):
             if q == 'best':
                 if fmt == 'MP3':
                     quality_args = ['-q:a', '0']
-                elif fmt in ('OGG', 'Opus'):
-                    quality_args = ['-q:a', '6']
-                # else: leave encoder to choose default
-            else:
-                if fmt == 'MP3':
-                    quality_args = ['-b:a', f'{q}k']
+                elif fmt == 'OGG':
+                    quality_args = ['-q:a', '8']
                 elif fmt == 'Opus':
-                    quality_args = ['-b:a', f'{q}k']
-                else:
-                    quality_args = ['-b:a', f'{q}k']
+                    quality_args = ['-b:a', '192k']   # libopus has no -q:a
+                # else: leave the encoder on its own default
+            else:
+                quality_args = ['-b:a', f'{q}k']
         elif kind == 'video':
-            try:
-                quality_args = ['-crf', str(int(s['conv_video_crf']))]
-            except ValueError:
-                quality_args = ['-crf', '23']
+            crf = self._int_or_none(s['conv_video_crf'])
+            if crf is None or not 0 <= crf <= 63:
+                self._warn(f'CRF {s["conv_video_crf"]!r} out of range — using 23.')
+                crf = 23
+            quality_args = ['-crf', str(crf)]
 
-        ffmpeg_args = base_args + quality_args
-        overwrite_flag = ['-y'] if s['conv_overwrite'] else ['-n']
+        # Stream selection. Audio targets must drop the video stream, otherwise
+        # converting a video file to M4A/AAC/OGG/ALAC re-encodes and keeps the
+        # picture — an "audio" file many times the expected size. Dropping
+        # subtitle/data streams on video targets is belt-and-braces.
+        map_args = ['-vn', '-sn', '-dn'] if kind == 'audio' else ['-sn', '-dn']
+
+        ffmpeg_args = base_args + quality_args + map_args
+        overwrite = bool(s['conv_overwrite'])
+        overwrite_flag = ['-y'] if overwrite else ['-n']
         out_dir = s['conv_output_dir']
-        os.makedirs(out_dir, exist_ok=True)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as exc:
+            self._log(f'[ERR]  Cannot create output folder: {exc}\n', 'red')
+            return
 
-        started = 0
+        slot = self._conversion_slot()
+        started = skipped = 0
+        used: set = set()
         for item in self.conv_items.values():
             if item.status != ConvItem.PENDING:
                 continue
             stem = os.path.splitext(item.filename)[0]
             out_path = os.path.join(out_dir, f'{stem}.{ext}')
+
+            # Guard against ffmpeg reading and writing the same file, which
+            # truncates the source to a zero-byte file. Happens whenever the
+            # output folder is the source folder and the extension matches.
+            if self._same_file(out_path, item.path):
+                out_path = os.path.join(out_dir, f'{stem} (converted).{ext}')
+            # Two inputs with the same stem would otherwise race on one output.
+            norm = os.path.normcase(os.path.abspath(out_path))
+            if norm in used:
+                base, dot_ext = os.path.splitext(out_path)
+                n = 2
+                while os.path.normcase(os.path.abspath(f'{base} ({n}){dot_ext}')) in used:
+                    n += 1
+                out_path = f'{base} ({n}){dot_ext}'
+                norm = os.path.normcase(os.path.abspath(out_path))
+            used.add(norm)
+
+            if not overwrite and os.path.exists(out_path):
+                item.status = ConvItem.ERROR
+                item.error  = 'Output already exists (overwrite is off).'
+                self.msg_q.put(('conv_update', item))
+                skipped += 1
+                continue
+
             item.status = ConvItem.RUNNING
+            item.error  = ''
             self.msg_q.put(('conv_update', item))
             t = threading.Thread(
                 target=self._conv_worker,
-                args=(item, self._ffmpeg_path, ffmpeg_args, overwrite_flag, out_path),
+                args=(item, self._ffmpeg_path, ffmpeg_args, overwrite_flag,
+                      out_path, slot),
                 daemon=True)
             self._conv_threads[item.id] = t
             t.start()
             started += 1
 
         if started:
-            self._log(f'Starting {started} conversion(s) → {fmt}\n', 'yellow')
-        else:
-            self._log('No pending files to convert.\n', '')
+            self._log(f'Starting {started} conversion(s) → {fmt} '
+                      f'(max {self._conv_slot_size} at once).\n', 'yellow')
+        if skipped:
+            self._log(f'Skipped {skipped} file(s) — output exists.\n', 'yellow')
+        if not started and not skipped:
+            self._log('No pending files to convert.\n', 'yellow')
+
+    @staticmethod
+    def _same_file(a: str, b: str) -> bool:
+        try:
+            if os.path.exists(a) and os.path.exists(b):
+                return os.path.samefile(a, b)
+        except OSError:
+            pass
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+    def _conversion_slot(self) -> threading.Semaphore:
+        """Limit simultaneous ffmpeg processes. Each one happily saturates every
+        core, so running a whole queue at once made the machine unusable."""
+        want = max(1, min((os.cpu_count() or 4) // 2, 4))
+        if self._conv_slot is None or self._conv_slot_size != want:
+            self._conv_slot = threading.Semaphore(want)
+            self._conv_slot_size = want
+        return self._conv_slot
+
+    _DURATION_RE = re.compile(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)')
+    _TIME_RE     = re.compile(r'time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)')
 
     def _probe_duration(self, ffmpeg_bin: str, path: str) -> float:
         """Return file duration in seconds by running `ffmpeg -i <path>`."""
         try:
-            kw: dict = {'stderr': subprocess.PIPE, 'text': True, 'timeout': 15}
+            kw: dict = {'stderr': subprocess.PIPE, 'stdout': subprocess.DEVNULL,
+                        'text': True, 'encoding': 'utf-8', 'errors': 'replace',
+                        'timeout': 20}
             if sys.platform == 'win32':
                 kw['creationflags'] = subprocess.CREATE_NO_WINDOW
             # ffmpeg exits with code 1 (no output specified) but prints full
             # media info including "Duration: HH:MM:SS.ms" to stderr.
-            r = subprocess.run([ffmpeg_bin, '-i', path], **kw)
-            m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.\d+)', r.stderr)
+            r = subprocess.run([ffmpeg_bin, '-hide_banner', '-i', path], **kw)
+            m = self._DURATION_RE.search(r.stderr or '')
             if m:
                 return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
         except Exception:
             pass
         return 0.0
 
-    def _conv_worker(self, item: ConvItem, ffmpeg_bin: str,
-                     ffmpeg_args: list, overwrite: list, out_path: str):
+    @staticmethod
+    def _iter_ffmpeg_chunks(stream):
+        """Yield ffmpeg stderr fragments split on CR *and* LF.
+
+        ffmpeg rewrites its progress line in place using carriage returns, so
+        iterating the stream line-by-line (`for line in proc.stderr`) yields
+        nothing until the process exits — which is why the converter's progress
+        bar sat at zero and then jumped straight to done.
+        """
+        buf = ''
+        while True:
+            chunk = stream.read(256)
+            if not chunk:
+                break
+            buf += chunk
+            buf = buf.replace('\r\n', '\n')
+            while True:
+                idx = min((i for i in (buf.find('\r'), buf.find('\n')) if i >= 0),
+                          default=-1)
+                if idx < 0:
+                    break
+                piece, buf = buf[:idx], buf[idx + 1:]
+                if piece:
+                    yield piece
+        if buf:
+            yield buf
+
+    def _conv_worker(self, item: ConvItem, ffmpeg_bin: str, ffmpeg_args: list,
+                     overwrite: list, out_path: str, slot: threading.Semaphore):
+        acquired = False
+        tail: list = []
         try:
+            while not slot.acquire(timeout=0.25):
+                if item.is_cancelled:
+                    item.status = ConvItem.CANCELLED
+                    return
+            acquired = True
+            if item.is_cancelled:
+                item.status = ConvItem.CANCELLED
+                return
+
             # Probe duration for progress tracking
             item.duration = self._probe_duration(ffmpeg_bin, item.path)
 
@@ -2382,24 +2970,33 @@ class App(tk.Tk):
             if sys.platform == 'win32':
                 kw['creationflags'] = subprocess.CREATE_NO_WINDOW
 
-            cmd = ([ffmpeg_bin] + overwrite +
+            cmd = ([ffmpeg_bin, '-hide_banner', '-nostdin'] + overwrite +
                    ['-i', item.path] + ffmpeg_args + [out_path])
             proc = subprocess.Popen(
-                cmd, stderr=subprocess.PIPE, text=True,
-                encoding='utf-8', errors='replace', **kw)
+                cmd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=True, encoding='utf-8', errors='replace', **kw)
             item._proc = proc
 
-            for line in proc.stderr:
+            for piece in self._iter_ffmpeg_chunks(proc.stderr):
                 if item.is_cancelled:
                     proc.terminate()
                     break
-                m = re.search(r'time=(\d+):(\d+):(\d+\.\d+)', line)
+                m = self._TIME_RE.search(piece)
                 if m and item.duration > 0:
                     elapsed = (int(m.group(1)) * 3600 +
                                int(m.group(2)) * 60 +
                                float(m.group(3)))
                     item.progress = min(elapsed / item.duration, 0.99)
                     self.msg_q.put(('conv_update', item))
+                elif not m:
+                    # Keep the last few non-progress lines; ffmpeg's actual
+                    # error message lives here and used to be thrown away,
+                    # leaving only a useless "exited with code 1".
+                    stripped = piece.strip()
+                    if stripped:
+                        tail.append(stripped)
+                        del tail[:-6]
 
             proc.wait()
 
@@ -2410,7 +3007,11 @@ class App(tk.Tk):
                 item.progress = 1.0
             else:
                 item.status = ConvItem.ERROR
-                item.error  = f'FFmpeg exited with code {proc.returncode}'
+                reason = next((t for t in reversed(tail)
+                               if not t.startswith(('frame=', 'size=', 'video:'))), '')
+                item.error = (f'FFmpeg failed (code {proc.returncode}): {reason}'
+                              if reason else
+                              f'FFmpeg exited with code {proc.returncode}')
 
         except Exception as exc:
             if item.is_cancelled:
@@ -2419,9 +3020,15 @@ class App(tk.Tk):
                 item.status = ConvItem.ERROR
                 item.error  = str(exc)
         finally:
+            if acquired:
+                slot.release()
+            item._proc = None
             self.msg_q.put(('conv_update', item))
-            tag = 'green' if item.status == ConvItem.DONE else 'red'
+            tag = {ConvItem.DONE: 'green',
+                   ConvItem.CANCELLED: 'yellow'}.get(item.status, 'red')
             self.msg_q.put(('log', f'[{item.status.upper()}] {item.filename}\n', tag))
+            if item.status == ConvItem.ERROR and item.error:
+                self.msg_q.put(('log', f'       {item.error}\n', 'red'))
 
     # ─── Tooltip ──────────────────────────────────────────────────────────────
     def _tooltip(self, widget: tk.Widget, text: str) -> tk.Widget:
@@ -2470,9 +3077,15 @@ class App(tk.Tk):
                 self._total_prog.pack_forget()
             done = sum(1 for i in self.items.values()
                        if i.status == DownloadItem.DONE)
-            if done and self.items:
-                self.status_var.set(f'{done}/{len(self.items)} done')
+            summary = f'{done}/{len(self.items)} done' if (done and self.items) else ''
+            # Only rewrite the status line when the summary actually changes;
+            # this runs on every card update and used to wipe out transient
+            # messages like "Settings saved" within 80 ms.
+            if summary and summary != self._last_status_summary:
+                self.status_var.set(summary)
+            self._last_status_summary = summary
             return
+        self._last_status_summary = ''
         pct = sum(i.progress for i in active) / len(active) * 100
         self._total_prog.configure(value=pct)
         if not self._total_prog.winfo_ismapped():
@@ -2484,14 +3097,42 @@ class App(tk.Tk):
     def _trunc(text: str, n: int) -> str:
         return text if len(text) <= n else text[:n - 1] + '…'
 
+    @staticmethod
+    def _fmt_eta(seconds) -> str:
+        """'45s' / '3m12s' / '1h04m' — plain seconds got unreadable past a
+        couple of minutes."""
+        try:
+            secs = int(seconds)
+        except (TypeError, ValueError):
+            return ''
+        if secs < 0:
+            return ''
+        if secs < 60:
+            return f'{secs}s'
+        mins, secs = divmod(secs, 60)
+        if mins < 60:
+            return f'{mins}m{secs:02d}s'
+        hours, mins = divmod(mins, 60)
+        return f'{hours}h{mins:02d}m'
+
     def destroy(self):
         try:
-            self.settings['window_geometry'] = self.winfo_geometry()
+            geo = self.winfo_geometry()
+            # Closing while minimised/withdrawn reports a degenerate size like
+            # '1x1+0+0'; persisting that reopens the app as an unusable sliver.
+            m = re.match(r'^(\d+)x(\d+)\+', geo)
+            if m and int(m.group(1)) >= 400 and int(m.group(2)) >= 300:
+                self.settings['window_geometry'] = geo
         except Exception:
             pass
         self._save_settings()
+        if self._poll_after_id is not None:
+            try:
+                self.after_cancel(self._poll_after_id)
+            except Exception:
+                pass
         for item in self.items.values():
-            if item.status in (DownloadItem.DOWNLOADING, DownloadItem.CONVERTING):
+            if item.status in DownloadItem.ACTIVE:
                 item.cancel()
         for item in self.conv_items.values():
             if item.status == ConvItem.RUNNING:
