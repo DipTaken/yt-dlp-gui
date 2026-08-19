@@ -109,6 +109,28 @@ These bit us once; re-check before changing download.py:
 - **Cards** in the queue/converter use the `_tint` / `_conv_tint` pattern to recolor a card and all non-ttk children at once when status changes.
 - **Status changes are pushed via `msg_q.put(('update', item))`** — `_handle()` is the single dispatch point for queue messages.
 
+## Syncing the vendored yt-dlp
+
+This repo is a **fork** of yt-dlp/yt-dlp — the full upstream history is here, so
+syncing is an ordinary merge, not a file copy.
+
+```powershell
+git fetch upstream                 # one-time: git remote add upstream https://github.com/yt-dlp/yt-dlp.git
+git merge upstream/master
+python check_sync.py               # MUST pass before trusting the merge
+```
+
+- `README.md` is marked `merge=ours` in [.gitattributes](.gitattributes), so it
+  no longer conflicts. That needs `git config merge.ours.driver true` once per
+  clone; without it the merge fails with *"Driver ours not found"*.
+- Nothing else has ever conflicted — the GUI lives in files upstream does not
+  have.
+- **[check_sync.py](check_sync.py) is the point of the exercise.** A renamed
+  option or a re-ordered postprocessor is accepted by `YoutubeDL` in silence and
+  simply stops working; the GUI keeps running and quietly does the wrong thing.
+  The script asserts every assumption in the two "gotchas" sections above and
+  encodes all 16 converter formats with the real ffmpeg.
+
 ## Files that are NOT ours
 
 The repo also contains the full upstream yt-dlp source tree:
