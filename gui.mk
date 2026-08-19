@@ -31,16 +31,23 @@ PYI_FLAGS := \
 	--distpath "$(DIST_DIR)" \
 	--workpath "$(BUILD_DIR)"
 
+# PyInstaller resolves Path.home() during analysis, which needs these set.
+# `export` works whatever shell make hands the recipe to — the old inline
+# `VAR=x cmd` prefix was POSIX-only, so mingw32-make (which uses cmd.exe) died
+# with "'USERPROFILE' is not recognized as an internal or external command".
+# `?=` leaves an existing value alone.
+USERPROFILE ?= C:/Users/$(USERNAME)
+HOME        ?= $(USERPROFILE)
+export USERPROFILE
+export HOME
+
 .PHONY: all build clean run rebuild
 
 all: build
 
 # Phony target — spaces in the output filename break make's filename rules,
 # so we let PyInstaller decide whether a rebuild is needed.
-# USERPROFILE/HOME are exported so PyInstaller can resolve Path.home() under msys make.
 build:
-	USERPROFILE="$${USERPROFILE:-C:/Users/$$USERNAME}" \
-	HOME="$${HOME:-$$USERPROFILE}" \
 	$(PYINSTALLER) $(PYI_FLAGS) "$(ENTRY)"
 
 rebuild: clean build
