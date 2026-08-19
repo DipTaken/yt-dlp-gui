@@ -4,3 +4,9 @@ Makefile* text whitespace=-tab-in-indent
 *.sh text eol=lf
 *.md diff=markdown
 *.py diff=python
+
+# This fork replaces upstream's README wholesale, so every sync from
+# yt-dlp/yt-dlp conflicts on it. `merge=ours` keeps our version instead.
+# Requires the driver to be registered once per clone:
+#     git config merge.ours.driver true
+README.md merge=ours
