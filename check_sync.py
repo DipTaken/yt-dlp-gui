@@ -22,11 +22,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from yt_dlp import YoutubeDL
 from yt_dlp.postprocessor import FFmpegExtractAudioPP, MetadataParserPP
+from yt_dlp.postprocessor.ffmpeg import ACODECS
 from yt_dlp.version import __version__ as YTDLP_VERSION
 
 from ytdlp_gui import config
+from ytdlp_gui.audio_filters import build_audio_filter_chain
 from ytdlp_gui.convert import build_conv_args
-from ytdlp_gui.download import build_ydl_opts, parse_clip_range
+from ytdlp_gui.download import audio_encoder_for, build_ydl_opts, parse_clip_range
 from ytdlp_gui.ffmpeg_utils import find_ffmpeg, no_window_kwargs
 from ytdlp_gui.models import DownloadItem
 
@@ -40,13 +42,37 @@ def check(label, cond, detail=''):
         FAILS.append(label)
 
 
-def opts_for(**over):
-    """Build ydl opts from defaults plus overrides, capturing warnings."""
+def opts_for(clip=None, **over):
+    """Build ydl opts from defaults plus overrides, capturing warnings.
+
+    `clip` goes on the *item*, not the settings: a clip range is per queue
+    entry, which is what lets one video be queued twice for two sections.
+    """
     s = {**config.DEFAULT_SETTINGS, **over}
     return build_ydl_opts(
-        DownloadItem('https://example.com/v'), s,
+        DownloadItem('https://example.com/v', clip_range=clip), s,
         ffmpeg_path='', logger=None, progress_hook=None, pp_hook=None,
         warn=WARNINGS.append)
+
+
+def name_for(opts, info, tmpl_type=''):
+    """Render a filename exactly the way YoutubeDL would for these opts."""
+    ydl = YoutubeDL({'quiet': True, 'simulate': True,
+                     'outtmpl': opts['outtmpl'], 'paths': opts.get('paths', {})})
+    try:
+        return ydl.prepare_filename(dict(info), tmpl_type)
+    finally:
+        ydl.close()
+
+
+def ffmpeg_accepts(ff, args, source_args=('-f', 'lavfi', '-i', 'sine=f=440:d=1')):
+    """Run a real encode with `args` and report (ok, last stderr line)."""
+    r = subprocess.run([ff, '-hide_banner', '-nostdin', '-y', *source_args,
+                        *args, '-f', 'null', '-'],
+                       capture_output=True, text=True, encoding='utf-8',
+                       errors='replace', **no_window_kwargs())
+    tail = ((r.stderr or '').strip().splitlines() or [''])[-1]
+    return r.returncode == 0, tail[:90]
 
 
 U = 'https://example.com/v'
@@ -92,8 +118,17 @@ check('daterange is a DateRange', 'daterange' in o and '20240615' in o['daterang
 check('no CLI-only date keys leaked', not {'dateafter', 'datebefore'} & o.keys())
 # These are read straight off params; a rename upstream would silently disable them.
 for key in ('format', 'outtmpl', 'postprocessors', 'writethumbnail', 'noplaylist',
-            'concurrent_fragment_downloads', 'retries', 'fragment_retries'):
+            'concurrent_fragment_downloads', 'retries', 'fragment_retries',
+            'post_hooks', 'paths', 'ignoreerrors', 'extract_flat'):
     check(f'YoutubeDL documents "{key}"', key in YoutubeDL.__doc__, '')
+o = opts_for()
+check('ignoreerrors lets a playlist survive one dead entry',
+      o.get('ignoreerrors') == 'only_download', o.get('ignoreerrors'))
+check('paths.home carries the output folder',
+      o.get('paths', {}).get('home') == config.DEFAULT_SETTINGS['output_dir'],
+      o.get('paths'))
+check('post_hooks is accepted and registered',
+      len(YoutubeDL({'quiet': True, 'post_hooks': [lambda p: None]})._post_hooks) == 1)
 
 print()
 print('=== format selection still behaves ===')
@@ -158,7 +193,54 @@ y = YoutubeDL({'quiet': True, 'postprocessor_args': o.get('postprocessor_args', 
 got = FFmpegExtractAudioPP(y)._configuration_args('ffmpeg')
 y.close()
 check('yt-dlp actually receives the audio args',
-      got == ['-af', 'loudnorm', '-ar', '48000'], got)
+      got == ['-c:a', 'libmp3lame', '-af', 'loudnorm', '-ar', '48000'], got)
+
+print()
+print('=== audio extraction targets exist upstream ===')
+missing = [f for f in config.AUDIO_FORMATS
+           if f not in FFmpegExtractAudioPP.SUPPORTED_EXTS]
+check('every offered audio format is one yt-dlp knows', not missing, missing)
+no_encoder = [f for f in config.AUDIO_FORMATS if not audio_encoder_for(f)]
+check('every audio format resolves to an ffmpeg encoder', not no_encoder, no_encoder)
+check('ogg is not offered (the codec is called vorbis)',
+      'ogg' not in config.AUDIO_FORMATS)
+check('an old "ogg" setting migrates to vorbis',
+      config.migrate_settings({'audio_format': 'ogg'}, 2)['audio_format'] == 'vorbis')
+# Every format must pair its own encoder with the filters; ACODECS leaves the
+# encoder blank for wav/alac, and a blank -c:a would be a broken command line.
+for fmt in config.AUDIO_FORMATS:
+    args = opts_for(audio_extract=True, audio_format=fmt,
+                    audio_tempo='75')['postprocessor_args']['extractaudio']
+    check(f'{fmt} filters carry an explicit encoder',
+          args[0] == '-c:a' and args[1] == audio_encoder_for(fmt), args[:2])
+
+print()
+print('=== clip ranges land in the filename ===')
+o = opts_for(clip=(90.0, 165.0))
+got = name_for(o, {'title': 'T', 'id': 'x', 'ext': 'mp4',
+                   'section_start': 90.0, 'section_end': 165.0})
+check('a clip range is written into the name',
+      got.endswith('T [x] [clip 00h01m30s-00h02m45s].mp4'), got)
+got = name_for(o, {'title': 'T', 'id': 'x', 'ext': 'mp4',
+                   'section_start': 90.0, 'section_end': None})
+check('an open-ended clip says "end"', got.endswith('-end].mp4'), got)
+got = name_for(opts_for(), {'title': 'T', 'id': 'x', 'ext': 'mp4'})
+check('no clip range means no suffix', got.endswith('T [x].mp4'), got)
+got = name_for(opts_for(audio_extract=True, audio_tempo='75', audio_transpose='2'),
+               {'title': 'T', 'id': 'x', 'ext': 'mp3'})
+check('a practice copy is named so it cannot overwrite the original',
+      got.endswith('T [x] [75% speed] [+2 st].mp3'), got)
+
+print()
+print('=== split chapters land in the output folder ===')
+o = opts_for(split_chapters=True)
+got = name_for(o, {'title': 'Album', 'id': 'x', 'ext': 'mp3',
+                   'section_number': 1, 'section_title': 'Track One'}, 'chapter')
+check('the chapter template is set at all', 'chapter' in o['outtmpl'])
+check('a chapter file goes to the chosen folder, not the CWD',
+      os.path.dirname(got) == config.DEFAULT_SETTINGS['output_dir'], got)
+check('a chapter file keeps the chosen filename layout',
+      got.endswith('Album [x] - 001 Track One.mp3'), os.path.basename(got))
 
 print()
 print('=== music tagging still parses ===')
@@ -176,10 +258,14 @@ print()
 print('=== clip range ===')
 s = {**config.DEFAULT_SETTINGS, 'clip_start': '1:30', 'clip_end': '2:45'}
 check('timestamps parse', parse_clip_range(s, WARNINGS.append) == (90.0, 165.0))
-o = opts_for(clip_start='1:30', clip_end='2:45', clip_precise=True)
+o = opts_for(clip=(90.0, 165.0), clip_precise=True)
 rng = list(o['download_ranges']({'duration': 600}, None))
 check('download_ranges yields the window',
       rng == [{'start_time': 90.0, 'end_time': 165.0}], rng)
+check('force_keyframes_at_cuts travels with it',
+      o.get('force_keyframes_at_cuts') is True)
+check('the sidebar boxes alone do not clip anything',
+      'download_ranges' not in opts_for(clip_start='1:30', clip_end='2:45'))
 
 print()
 print('=== every option combination constructs ===')
@@ -240,6 +326,60 @@ else:
         else:
             detail = ((r.stderr or '').strip().splitlines() or ['?'])[-1][:100]
         check(fmt, ok, detail)
+
+    print()
+    print('=== every converter preset encodes ===')
+    for name in config.CONV_PRESETS:
+        s = config.apply_conv_preset(config.DEFAULT_SETTINGS, name)
+        built = build_conv_args(s, WARNINGS.append, WARNINGS.append)
+        if not built:
+            check(name, False, 'builder returned nothing')
+            continue
+        in_args, out_args, ext = built
+        out = os.path.join(work, f'p{abs(hash(name))}.{ext}')
+        r = subprocess.run([FF, '-hide_banner', '-nostdin', '-y'] + in_args +
+                           ['-i', src] + out_args + [out],
+                           capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', **no_window_kwargs())
+        ok = r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+        check(name, ok, '' if ok else
+              ((r.stderr or '').strip().splitlines() or ['?'])[-1][:90])
+
+    print()
+    print('=== practice filter chains are valid ffmpeg ===')
+    for tempo, steps, mode in ((100, 0, 'Stereo'), (50, 0, 'Stereo'),
+                               (75, 5, 'Mono (mix)'), (100, -12, 'Left only'),
+                               (150, 0, 'Right only'), (50, 12, 'Stereo')):
+        chain = build_audio_filter_chain(
+            tempo, steps, config.AUDIO_CHANNEL_MODES[mode],
+            'I=-16:TP=-1.5:LRA=11')
+        ok, tail = ffmpeg_accepts(FF, ['-af', chain] if chain else [])
+        check(f'chain {tempo}% {steps:+d}st {mode}', ok, tail)
+
+    print()
+    print('=== audio filters survive a stream copy ===')
+    # ExtractAudio emits `-acodec copy` whenever the source is already in the
+    # target codec. Filters against a copied stream fail outright unless an
+    # explicit encoder comes with them — the exact shape yt-dlp builds.
+    for fmt in config.AUDIO_FORMATS:
+        ext, encoder, more = ACODECS[fmt]
+        probe_src = os.path.join(work, f'copy_src.{ext}')
+        subprocess.run([FF, '-y', '-hide_banner', '-loglevel', 'error',
+                        '-f', 'lavfi', '-i', 'sine=f=440:d=1']
+                       + (['-c:a', encoder] if encoder else []) + [probe_src],
+                       check=True, **no_window_kwargs())
+        extra = opts_for(audio_extract=True, audio_format=fmt,
+                         audio_normalize=True, audio_tempo='75'
+                         )['postprocessor_args']['extractaudio']
+        out = os.path.join(work, f'copy_out.{ext}')
+        r = subprocess.run([FF, '-hide_banner', '-nostdin', '-y', '-i', probe_src,
+                            '-vn', '-acodec', 'copy', *more,
+                            '-movflags', '+faststart', *extra, out],
+                           capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', **no_window_kwargs())
+        ok = r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+        check(f'{fmt}: filters + stream copy', ok, '' if ok else
+              ((r.stderr or '').strip().splitlines() or ['?'])[-1][:90])
 
     import shutil
     shutil.rmtree(work, ignore_errors=True)

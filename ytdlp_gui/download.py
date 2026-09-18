@@ -8,11 +8,51 @@ The yt-dlp API gotchas encoded here are documented in CLAUDE.md; read them
 before changing anything.
 """
 import os
+import re
 
 from yt_dlp.postprocessor import MetadataParserPP
+from yt_dlp.postprocessor.ffmpeg import ACODECS
 from yt_dlp.utils import DateRange, download_range_func, parse_bytes, parse_duration
 
-from .config import COMPAT_MODES, DEFAULT_COMPAT_MODE, FORMAT_PRESETS
+from .audio_filters import build_audio_filter_chain, practice_suffix
+from .config import (
+    AUDIO_CHANNEL_MODES, AUDIO_ENCODER_OVERRIDES, CHAPTER_SUFFIX_TMPL,
+    CLIP_SUFFIX_TMPL, COMPAT_MODES, DEFAULT_COMPAT_MODE, FORMAT_PRESETS,
+)
+
+# The tail every sane output template ends with. Suffixes have to go *before*
+# it or they would land after the file extension.
+_EXT_TAIL_RE = re.compile(r'\.%\(ext\)s$')
+
+
+def insert_before_ext(template: str, suffix: str, warn=None) -> str:
+    """Splice `suffix` in ahead of the `.%(ext)s` tail.
+
+    A hand-written template need not end that way; appending is then the only
+    thing we can do, and it is worth saying so, because the result will not
+    have a usable extension.
+    """
+    if not suffix:
+        return template
+    if _EXT_TAIL_RE.search(template):
+        return _EXT_TAIL_RE.sub(suffix + '.%(ext)s', template)
+    if warn:
+        warn(f'Filename template does not end in ".%(ext)s" — appending '
+             f'"{suffix.strip()}" to the end instead.')
+    return template + suffix
+
+
+def audio_encoder_for(fmt: str) -> str:
+    """The ffmpeg encoder yt-dlp would use for an audio-extraction target.
+
+    ACODECS leaves the encoder empty for the two formats it treats specially,
+    so those are filled in here. Needed because any `-af`/`-ar` of ours has to
+    be paired with an explicit `-c:a` — see build_ydl_opts.
+    """
+    if fmt in AUDIO_ENCODER_OVERRIDES:
+        return AUDIO_ENCODER_OVERRIDES[fmt]
+    entry = ACODECS.get(fmt)
+    return (entry[1] if entry else '') or ''
 
 
 def int_or_none(value) -> 'int | None':
@@ -189,14 +229,26 @@ def parse_clip_range(s: dict, warn) -> 'tuple[float, float] | None':
     return start, end
 
 def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
-                   progress_hook, pp_hook, warn) -> dict:
+                   progress_hook, pp_hook, warn, post_hook=None) -> dict:
     pp, want_thumb_file = build_postprocessors(s)
 
     template = s['output_template'] or '%(title)s [%(id)s].%(ext)s'
-    if os.path.isabs(template):
-        outtmpl = template          # template already carries its own path
-    else:
-        outtmpl = os.path.join(s['output_dir'], template)
+
+    # A clip range has to show up in the name. yt-dlp renders every range
+    # through the *default* template, so without this two sections of one
+    # video resolve to the same path and the second overwrites the first.
+    clip = getattr(item, 'clip_range', None)
+    if clip:
+        template = insert_before_ext(template, CLIP_SUFFIX_TMPL, warn)
+
+    # Same reasoning for a practice copy: a 75% speed version must not land on
+    # top of the normal one. '%' is doubled because this is a template.
+    if s['audio_extract']:
+        practice = practice_suffix(s.get('audio_tempo', '100'),
+                                   s.get('audio_transpose', '0'))
+        if practice:
+            template = insert_before_ext(template, practice.replace('%', '%%'),
+                                         warn)
 
     sub_langs = [ln.strip() for ln in s['sub_langs'].split(',') if ln.strip()]
     want_subs = bool(s['write_subs'] or s['auto_subs'])
@@ -204,7 +256,13 @@ def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
         sub_langs = ['en']
 
     opts: dict = {
-        'outtmpl':           outtmpl,
+        # 'chapter' is what FFmpegSplitChaptersPP renders each piece through.
+        # Leaving it at yt-dlp's default meant split files ignored the chosen
+        # filename layout *and* landed in the process working directory.
+        'outtmpl': {
+            'default': template,
+            'chapter': insert_before_ext(template, CHAPTER_SUFFIX_TMPL),
+        },
         'postprocessors':    pp,
         'writethumbnail':    want_thumb_file,
         'writeinfojson':     s['write_infojson'],
@@ -212,6 +270,10 @@ def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
         'writeautomaticsub': s['auto_subs'],
         'subtitleslangs':    sub_langs if want_subs else [],
         'noplaylist':        s['no_playlist'],
+        # The API default is False, which aborts a whole playlist on the first
+        # private or deleted entry. The CLI uses 'only_download'; so do we, and
+        # the worker reports "26 of 27" rather than one red card.
+        'ignoreerrors':      'only_download',
         'quiet':             True,
         'no_warnings':       False,
         'noprogress':        True,
@@ -219,20 +281,39 @@ def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
         'progress_hooks':      [progress_hook],
         'postprocessor_hooks': [pp_hook],
     }
+    # An absolute template carries its own location and yt-dlp ignores `paths`
+    # for it; otherwise 'home' is what makes *every* output — including the
+    # per-chapter files above — land in the chosen folder.
+    if not os.path.isabs(template):
+        opts['paths'] = {'home': s['output_dir']}
+    if post_hook is not None:
+        opts['post_hooks'] = [post_hook]
     opts.update(build_format_opts(item, s, warn))
 
-    # Audio postprocessor extra args (normalize / sample rate).
+    # Audio postprocessor extra args (practice filters / normalize / rate).
     # Keys are matched case-insensitively against a *lower-cased* pp key, so
     # 'FFmpegExtractAudio' — the old value here — never matched anything and
     # both options were silently discarded.
     if s['audio_extract']:
         pp_extra: list[str] = []
-        if s.get('audio_normalize'):
-            pp_extra += ['-af', 'loudnorm']
+        chain = build_audio_filter_chain(
+            s.get('audio_tempo', '100'), s.get('audio_transpose', '0'),
+            AUDIO_CHANNEL_MODES.get(s.get('audio_channels', 'Stereo'), ''),
+            'loudnorm' if s.get('audio_normalize') else '')
+        if chain:
+            pp_extra += ['-af', chain]
         if s.get('audio_sample_rate'):
             pp_extra += ['-ar', str(s['audio_sample_rate'])]
         if pp_extra:
-            opts['postprocessor_args'] = {'extractaudio': pp_extra}
+            # ExtractAudio stream-copies whenever the source is already in the
+            # target codec (every m4a/opus download from YouTube), emitting
+            # `-acodec copy`. Filters against a copied stream make ffmpeg exit
+            # with "Invalid argument" and lose the file, so an explicit encoder
+            # — which wins, being last on the command line — has to come with
+            # them. Verified against ffmpeg 8.1.
+            encoder = audio_encoder_for(s['audio_format'])
+            prefix = ['-c:a', encoder] if encoder else []
+            opts['postprocessor_args'] = {'extractaudio': prefix + pp_extra}
 
     # FFmpeg location
     if ffmpeg_path:
@@ -279,7 +360,9 @@ def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
             warn(f'Invalid date filter ({exc}) — ignoring.')
 
     # ── Clip range ───────────────────────────────────────────────────────
-    clip = parse_clip_range(s, warn)
+    # Read off the item, never the settings: the sidebar boxes are only the
+    # default handed to *new* queue entries, so that one video can be queued
+    # twice with two different ranges.
     if clip:
         start, end = clip
         opts['download_ranges'] = download_range_func([], [(start, end)])

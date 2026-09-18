@@ -53,6 +53,24 @@ _DURATION_RE = re.compile(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)')
 TIME_RE      = re.compile(r'time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)')
 
 
+def sibling_tool(ffmpeg_path: str, name: str) -> str:
+    """Locate ffprobe/ffplay next to a known ffmpeg, falling back to PATH.
+
+    The bare name is not good enough: Preferences → Tools can point at an
+    ffmpeg that is not on PATH at all (a portable unzip, a Scoop shim), and
+    then `ffprobe` resolves to nothing. Every companion tool ships in the same
+    folder as ffmpeg, so look there first. Returns '' if there is no such tool.
+    """
+    if ffmpeg_path:
+        folder = os.path.dirname(ffmpeg_path)
+        names = (f'{name}.exe', name) if sys.platform == 'win32' else (name,)
+        for candidate in names:
+            path = os.path.join(folder, candidate)
+            if os.path.isfile(path):
+                return path
+    return shutil.which(name) or ''
+
+
 def no_window_kwargs() -> dict:
     """Keep ffmpeg/ffprobe from flashing a console window on Windows."""
     if sys.platform == 'win32':

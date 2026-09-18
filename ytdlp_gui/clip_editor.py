@@ -24,9 +24,9 @@ import queue
 import subprocess
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
-from .ffmpeg_utils import no_window_kwargs
+from .ffmpeg_utils import no_window_kwargs, sibling_tool
 from .theme import (
     BASE, BLUE, CRUST, GREEN, MANTLE, MAUVE, OVL0, PEACH, RED, SUBT0, SURF0,
     SURF1, SURF2, TEXT, YELLOW, apply_dark_titlebar,
@@ -67,11 +67,20 @@ class ClipEditor(tk.Toplevel):
         apply_dark_titlebar(self)
 
         self._ffmpeg = ffmpeg
+        # ffprobe/ffplay live next to ffmpeg. Looking them up by bare name —
+        # what this did before — fails whenever ffmpeg was set by hand in
+        # Preferences and is not on PATH, and the failure looked like
+        # "could not read this media".
+        self._ffprobe = sibling_tool(ffmpeg, 'ffprobe')
+        self._ffplay = sibling_tool(ffmpeg, 'ffplay')
         self._source = source
         self._resolver = resolver
         self._on_apply = on_apply
         self._title = title
 
+        self._play_proc = None
+        self._play_after = None
+        self.has_video = True
         self.duration = 0.0
         self.fps = 0.0
         self.pos = float(initial_in or 0.0)
@@ -88,6 +97,8 @@ class ClipEditor(tk.Toplevel):
         # Cached on the main thread so the waveform worker never has to ask a
         # widget for its size.
         self._timeline_w = 800
+        # Grows for an audio-only file, where the waveform is the whole UI.
+        self._wave_h = WAVE_H
 
         self._build_ui()
         self._poll()
@@ -119,7 +130,7 @@ class ClipEditor(tk.Toplevel):
 
         # Timeline: waveform + in/out shading + playhead
         self._timeline = tk.Canvas(self, bg=MANTLE, highlightthickness=0, bd=0,
-                                   height=WAVE_H, cursor='sb_h_double_arrow')
+                                   height=self._wave_h, cursor='sb_h_double_arrow')
         self._timeline.pack(fill='x', padx=14, pady=(4, 0))
         self._timeline.bind('<Configure>', self._on_timeline_resize)
         for ev in ('<Button-1>', '<B1-Motion>'):
@@ -150,6 +161,36 @@ class ClipEditor(tk.Toplevel):
         mk(bar, 'frame ▶', lambda: self.step(1), 'Next frame  (→)')
         mk(bar, 'key ▶▶', self.next_keyframe, 'Next keyframe  (Shift+→)')
         mk(bar, '⏭', lambda: self.seek_to(self.duration), 'End  (End)')
+
+        # ── Review the selection ──────────────────────────────────────────────
+        # Marks you cannot hear are guesswork. ffplay ships beside ffmpeg, so
+        # previewing the actual in/out range costs no new dependency.
+        play = tk.Frame(self, bg=BASE)
+        play.pack(fill='x', padx=14, pady=(6, 0))
+        self._play_btn = mk(play, '▶  Play selection', self.toggle_play,
+                            'Play from the in point to the out point  (Space)',
+                            bg=SURF1, activebackground=SURF2)
+        self._loop_var = tk.BooleanVar(value=False)
+        loop_chk = ttk.Checkbutton(play, text='Loop', variable=self._loop_var)
+        loop_chk.pack(side='left', padx=(10, 0))
+        _tip(loop_chk, 'Repeat the selection until you press Stop — how you '
+                       'work a bar out by ear.')
+        tk.Label(play, text='Speed', bg=BASE, fg=SUBT0,
+                 font=('Segoe UI', 9)).pack(side='left', padx=(14, 4))
+        self._speed_var = tk.StringVar(value='100%')
+        speed_cb = ttk.Combobox(play, textvariable=self._speed_var, width=6,
+                                state='readonly',
+                                values=['100%', '75%', '50%', '25%'])
+        speed_cb.pack(side='left')
+        _tip(speed_cb, 'Slows playback without changing the pitch. Only affects '
+                       'this preview, not what gets downloaded.')
+        mk(play, '⭳ Save frame…', self.save_frame,
+           'Write the current frame to a PNG at full resolution')
+
+        if not self._ffplay:
+            self._play_btn.configure(state='disabled')
+            _tip(self._play_btn, 'ffplay was not found next to ffmpeg, so the '
+                                 'preview cannot play audio.')
 
         marks = tk.Frame(self, bg=BASE)
         marks.pack(fill='x', padx=14, pady=(6, 0))
@@ -184,7 +225,8 @@ class ClipEditor(tk.Toplevel):
                   padx=14, pady=7, cursor='hand2').pack(side='left', padx=(8, 0))
         self._hint = tk.Label(
             foot,
-            text='←/→ frame · Shift+←/→ keyframe · I/O set marks · Home/End',
+            text='←/→ frame · Shift+←/→ keyframe · I/O set marks · '
+                 'Space play · Home/End',
             bg=BASE, fg=OVL0, font=('Segoe UI', 8))
         self._hint.pack(side='right')
 
@@ -197,8 +239,122 @@ class ClipEditor(tk.Toplevel):
         self.bind('<End>',         lambda _e: self.seek_to(self.duration))
         self.bind('<i>',           lambda _e: self.set_in())
         self.bind('<o>',           lambda _e: self.set_out())
+        self.bind('<space>',       lambda _e: (self.toggle_play(), 'break')[-1])
         self.bind('<Escape>',      lambda _e: self.destroy())
         self.focus_set()
+
+    # ── playback ─────────────────────────────────────────────────────────────
+    def toggle_play(self):
+        if self._play_proc is not None:
+            self.stop_play()
+        else:
+            self.start_play()
+
+    def start_play(self):
+        """Hand the marked range to ffplay.
+
+        `-ss` before `-i` seeks rather than decoding and discarding, and `-t`
+        is a duration relative to that seek — the same rule the converter
+        follows. `-autoexit` is what lets the loop check work.
+        """
+        if not self._ffplay or not self.duration:
+            return
+        out = self.mark_out if self.mark_out is not None else self.duration
+        length = max(out - self.mark_in, 0.05)
+        speed = {'100%': 1.0, '75%': 0.75, '50%': 0.5, '25%': 0.25}.get(
+            self._speed_var.get(), 1.0)
+        cmd = [self._ffplay, '-hide_banner', '-loglevel', 'error', '-autoexit',
+               '-ss', f'{self.mark_in:.3f}', '-t', f'{length:.3f}']
+        if not self.has_video:
+            cmd.append('-nodisp')
+        if speed != 1.0:
+            cmd += ['-af', f'atempo={speed}']
+        cmd += ['-window_title', f'Preview — {self._title}', self._source]
+        try:
+            self._play_proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, **no_window_kwargs())
+        except Exception as exc:
+            self._status.configure(text=f'Could not start playback: {exc}', fg=RED)
+            self._play_proc = None
+            return
+        self._play_btn.configure(text='■  Stop')
+        self._status.configure(text='Playing the selection…', fg=SUBT0)
+        self._poll_play()
+
+    def _poll_play(self):
+        """Watch for ffplay exiting, and restart it when Loop is on.
+
+        Relying on ffplay's own `-loop` is not an option: it restarts the whole
+        input, ignoring the `-ss`/`-t` window, so it would loop the wrong
+        thing.
+        """
+        proc = self._play_proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            self._play_after = self.after(200, self._poll_play)
+            return
+        self._play_proc = None
+        self._play_after = None
+        if self._loop_var.get() and not self._closing:
+            self.start_play()
+        else:
+            self._play_btn.configure(text='▶  Play selection')
+            self._status.configure(text='', fg=SUBT0)
+
+    def stop_play(self):
+        if self._play_after is not None:
+            try:
+                self.after_cancel(self._play_after)
+            except Exception:
+                pass
+            self._play_after = None
+        proc, self._play_proc = self._play_proc, None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            self._play_btn.configure(text='▶  Play selection')
+            self._status.configure(text='', fg=SUBT0)
+        except tk.TclError:
+            pass
+
+    # ── stills ───────────────────────────────────────────────────────────────
+    def save_frame(self):
+        """Write the current frame to PNG at the source's real resolution.
+
+        Not the preview bytes: those are scaled to 640px for speed, and a
+        thumbnail is no use as a reference still or a thumbnail source.
+        """
+        if not self.duration:
+            return
+        if not self.has_video:
+            self._status.configure(text='This file has no video to grab.', fg=YELLOW)
+            return
+        safe = ''.join(c for c in self._title if c not in '\\/:*?"<>|').strip()
+        default = f'{safe[:60] or "frame"} @ {fmt_tc(self.pos).replace(":", "h", 1).replace(":", "m", 1)}.png'
+        path = filedialog.asksaveasfilename(
+            parent=self, title='Save frame', defaultextension='.png',
+            initialfile=default,
+            filetypes=[('PNG image', '*.png'), ('All files', '*.*')])
+        if not path:
+            return
+        pos = self.pos
+        self._status.configure(text='Saving frame…', fg=SUBT0)
+
+        def worker():
+            r = self._run([self._ffmpeg, '-hide_banner', '-nostdin', '-y',
+                           '-ss', f'{pos:.3f}', '-i', self._source,
+                           '-frames:v', '1', path])
+            if r.returncode == 0 and os.path.exists(path):
+                self._post('status', f'Saved {os.path.basename(path)}', GREEN)
+            else:
+                self._post('status', 'Could not save that frame.', RED)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ── background preparation ───────────────────────────────────────────────
     def _prepare(self):
@@ -217,11 +373,18 @@ class ClipEditor(tk.Toplevel):
             if not info:
                 self._post('status', 'Could not read this media.', RED)
                 return
+            # Set here, on this thread, before the waveform is rendered: the
+            # main thread only learns the file is audio-only when it handles
+            # the message below, which would be too late to size the picture.
+            self.has_video = info.get('has_video', True)
+            if not self.has_video:
+                self._wave_h = 190
             self._post('probed', info)
 
-            # Start the render worker only once we know the duration.
-            threading.Thread(target=self._render_worker, daemon=True).start()
-            self._request_frame(self.pos)
+            # Frame extraction is pointless without a video stream.
+            if self.has_video:
+                threading.Thread(target=self._render_worker, daemon=True).start()
+                self._request_frame(self.pos)
 
             self._post('status', 'Building waveform…')
             self._post('wave', self._waveform_png())
@@ -235,7 +398,9 @@ class ClipEditor(tk.Toplevel):
         return subprocess.run(cmd, capture_output=True, **no_window_kwargs(), **kw)
 
     def _probe(self) -> dict:
-        r = self._run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+        if not self._ffprobe:
+            return {}
+        r = self._run([self._ffprobe, '-v', 'error', '-select_streams', 'v:0',
                        '-show_entries',
                        'stream=r_frame_rate,avg_frame_rate,width,height:'
                        'format=duration',
@@ -243,8 +408,21 @@ class ClipEditor(tk.Toplevel):
         if r.returncode:
             return {}
         data = json.loads(r.stdout or '{}')
-        st = (data.get('streams') or [{}])[0]
+        streams = data.get('streams') or []
+        st = streams[0] if streams else {}
         dur = float((data.get('format') or {}).get('duration') or 0)
+
+        if not streams or not st.get('width'):
+            # No video stream — an MP3, a WAV, an audio-only download. Ask
+            # again without the video filter so the duration is still right.
+            r2 = self._run([self._ffprobe, '-v', 'error', '-show_entries',
+                            'format=duration', '-of', 'json', self._source],
+                           text=True)
+            if not r2.returncode:
+                dur = float((json.loads(r2.stdout or '{}').get('format') or {})
+                            .get('duration') or dur)
+            return {'duration': dur, 'fps': 0.0, 'w': 0, 'h': 0,
+                    'has_video': False}
 
         def rate(v):
             try:
@@ -253,7 +431,7 @@ class ClipEditor(tk.Toplevel):
             except Exception:
                 return 0.0
         fps = rate(st.get('avg_frame_rate') or '') or rate(st.get('r_frame_rate') or '')
-        return {'duration': dur, 'fps': fps,
+        return {'duration': dur, 'fps': fps, 'has_video': True,
                 'w': st.get('width') or 0, 'h': st.get('height') or 0}
 
     def _waveform_png(self) -> bytes:
@@ -265,13 +443,15 @@ class ClipEditor(tk.Toplevel):
             self._ffmpeg, '-hide_banner', '-nostdin', '-i', self._source,
             '-filter_complex',
             f'aformat=channel_layouts=mono,'
-            f'showwavespic=s={width}x{WAVE_H}:colors=0x7aa2f7',
+            f'showwavespic=s={width}x{self._wave_h}:colors=0x7aa2f7',
             '-frames:v', '1', '-f', 'image2pipe', '-c:v', 'png', '-'])
         return r.stdout if r.returncode == 0 else b''
 
     def _keyframe_times(self) -> list:
         """Keyframe timestamps via a packet scan — no decoding, so it's quick."""
-        r = self._run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+        if not self._ffprobe or not self.has_video:
+            return []
+        r = self._run([self._ffprobe, '-v', 'error', '-select_streams', 'v:0',
                        '-show_packets', '-show_entries', 'packet=pts_time,flags',
                        '-of', 'csv=p=0', self._source], text=True)
         if r.returncode:
@@ -332,11 +512,17 @@ class ClipEditor(tk.Toplevel):
                 elif kind == 'probed':
                     self.duration = payload['duration']
                     self.fps = payload['fps']
+                    self.has_video = payload.get('has_video', True)
                     if self.mark_out is None:
                         self.mark_out = self.duration
-                    self._dur_lbl.configure(
-                        text=f'/ {fmt_tc(self.duration)}   '
-                             f'{payload["w"]}×{payload["h"]} @ {self.fps:.3f} fps')
+                    if self.has_video:
+                        self._dur_lbl.configure(
+                            text=f'/ {fmt_tc(self.duration)}   '
+                                 f'{payload["w"]}×{payload["h"]} @ {self.fps:.3f} fps')
+                    else:
+                        self._dur_lbl.configure(
+                            text=f'/ {fmt_tc(self.duration)}   audio only')
+                        self._go_audio_only()
                     self._refresh_labels()
                     self._redraw_timeline()
                 elif kind == 'frame':
@@ -357,11 +543,29 @@ class ClipEditor(tk.Toplevel):
             return
         self.after(60, self._poll)
 
+    def _go_audio_only(self):
+        """Give an audio file the layout it deserves.
+
+        A 360-pixel black rectangle where the video would be is wasted space,
+        and the waveform is the only thing there is to aim at — so the frame
+        preview shrinks to a caption and the waveform takes the room.
+        """
+        self._preview.configure(height=44)
+        self._preview.pack_configure(expand=False)
+        self._wave_h = 190
+        self._timeline.configure(height=self._wave_h)
+        self._redraw_frame()
+
     # ── drawing ──────────────────────────────────────────────────────────────
     def _redraw_frame(self):
         c = self._preview
         c.delete('all')
         w, h = c.winfo_width(), c.winfo_height()
+        if not self.has_video:
+            c.create_text(w // 2, h // 2,
+                          text='Audio only — mark your points on the waveform',
+                          fill=SURF2, font=('Segoe UI', 10))
+            return
         if not self._frame_img or w < 2:
             c.create_text(w // 2, h // 2, text='no preview',
                           fill=SURF2, font=('Segoe UI', 11))
@@ -388,27 +592,27 @@ class ClipEditor(tk.Toplevel):
         if self._wave_img:
             c.create_image(0, 0, image=self._wave_img, anchor='nw')
         else:
-            c.create_rectangle(0, 0, w, WAVE_H, fill=MANTLE, outline='')
-            c.create_text(w // 2, WAVE_H // 2, text='waveform loading…',
+            c.create_rectangle(0, 0, w, self._wave_h, fill=MANTLE, outline='')
+            c.create_text(w // 2, self._wave_h // 2, text='waveform loading…',
                           fill=SURF2, font=('Segoe UI', 8))
 
         if self.duration:
             # keyframe ticks along the bottom
             for kt in self.keyframes:
                 x = self._x_for(kt, w)
-                c.create_line(x, WAVE_H - 6, x, WAVE_H, fill=SURF2)
+                c.create_line(x, self._wave_h - 6, x, self._wave_h, fill=SURF2)
 
             a = self._x_for(self.mark_in, w)
             b = self._x_for(self.mark_out if self.mark_out is not None
                             else self.duration, w)
             # dim everything outside the selection
-            c.create_rectangle(0, 0, a, WAVE_H, fill=CRUST, outline='', stipple='gray50')
-            c.create_rectangle(b, 0, w, WAVE_H, fill=CRUST, outline='', stipple='gray50')
-            c.create_line(a, 0, a, WAVE_H, fill=GREEN, width=2)
-            c.create_line(b, 0, b, WAVE_H, fill=PEACH, width=2)
+            c.create_rectangle(0, 0, a, self._wave_h, fill=CRUST, outline='', stipple='gray50')
+            c.create_rectangle(b, 0, w, self._wave_h, fill=CRUST, outline='', stipple='gray50')
+            c.create_line(a, 0, a, self._wave_h, fill=GREEN, width=2)
+            c.create_line(b, 0, b, self._wave_h, fill=PEACH, width=2)
 
             x = self._x_for(self.pos, w)
-            c.create_line(x, 0, x, WAVE_H, fill=MAUVE, width=2)
+            c.create_line(x, 0, x, self._wave_h, fill=MAUVE, width=2)
 
     def _refresh_labels(self):
         self._tc_lbl.configure(text=fmt_tc(self.pos, self.fps))
@@ -494,6 +698,9 @@ class ClipEditor(tk.Toplevel):
 
     def destroy(self):
         self._closing = True
+        # Kill the preview first: an ffplay left running after the window is
+        # gone keeps playing with nothing to stop it.
+        self.stop_play()
         self._render_req.put(None)
         super().destroy()
 

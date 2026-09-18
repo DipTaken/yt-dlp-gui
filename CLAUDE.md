@@ -14,7 +14,8 @@ This is a **tkinter desktop GUI wrapper around yt-dlp**, built on top of a vendo
 | [config.py](ytdlp_gui/config.py) | settings schema, presets, format/codec tables, migrations |
 | [theme.py](ytdlp_gui/theme.py) | Catppuccin Mocha palette + ttk styles |
 | [models.py](ytdlp_gui/models.py) | `DownloadItem`, `ConvItem`, `GUILogger` |
-| [ffmpeg_utils.py](ytdlp_gui/ffmpeg_utils.py) | locating ffmpeg, probing, stderr chunking |
+| [ffmpeg_utils.py](ytdlp_gui/ffmpeg_utils.py) | locating ffmpeg/ffprobe/ffplay, probing, stderr chunking |
+| [audio_filters.py](ytdlp_gui/audio_filters.py) | the `-af` chain: tempo, pitch, channels, loudness — **no tkinter** |
 | [download.py](ytdlp_gui/download.py) | yt-dlp option building — **no tkinter** |
 | [convert.py](ytdlp_gui/convert.py) | ffmpeg argument building — **no tkinter** |
 | [widgets.py](ytdlp_gui/widgets.py) | shared widget builders, tooltip, `WheelRouter` |
@@ -84,6 +85,13 @@ These bit us once; re-check before changing download.py:
 - Prefer `merge_output_format='mp4/mkv'` over `'mp4'`. With a single preference `get_compatible_ext` force-returns it even for codecs the container can't hold (VP9/Opus in MP4); the `/mkv` fallback keeps the file valid.
 - Resolution caps use format **sorting** (`format_sort=['res:720']`), not a `[height<=720]` filter. The filter makes the download fail outright when every available format exceeds the cap.
 - `download_ranges` takes a `download_range_func([], [(start, end)])` callable, not a plain tuple. Pair it with `force_keyframes_at_cuts` or cuts snap to the nearest keyframe.
+- **Clip ranges live on the `DownloadItem`, not in settings.** The sidebar Start/End boxes are only the default copied onto *new* queue entries. `build_ydl_opts` reads `item.clip_range` and nothing else, which is what lets one video sit in the queue twice with two different sections.
+- **Every clipped download needs `CLIP_SUFFIX_TMPL` in the filename.** yt-dlp renders all ranges through the *default* template, so without the suffix two sections of one video resolve to the same path and the second silently overwrites the first.
+- **Output paths go through `paths={'home': …}`, not `os.path.join` into the template.** `outtmpl` is a dict, and its `chapter` key is what `FFmpegSplitChaptersPP` renders each piece through. With neither set, split-chapter files ignore the chosen filename layout *and* land in the process working directory.
+- **`ignoreerrors` defaults to `False` for the API** (the CLI uses `'only_download'`). Left alone, one private or deleted entry aborts an entire playlist. With it set, `download()` still returns non-zero, so "did anything arrive?" is answered by `item.paths`, not the return code.
+- **`post_hooks` is the only way to learn where a file actually landed.** It fires once per finished file, after the postprocessors have renamed and re-containered everything. `Open`, `Show in folder` and the after-download conversion all depend on it.
+- **Extra `-af`/`-ar` postprocessor args must be paired with an explicit `-c:a`.** `FFmpegExtractAudioPP` stream-copies whenever the source is already in the target codec — every m4a/opus download from YouTube — emitting `-acodec copy`. Filters against a copied stream make ffmpeg exit with "Invalid argument" and lose the file. Our `-c:a` wins because yt-dlp appends `postprocessor_args` last. `audio_encoder_for()` fills in the two encoders `ACODECS` leaves blank (wav, alac).
+- **`config.AUDIO_FORMATS` must stay a subset of `FFmpegExtractAudioPP.SUPPORTED_EXTS`.** `ogg` is *not* one of them — the codec is called `vorbis`, and offering `ogg` raised a `KeyError` deep in the postprocessor. check_sync asserts the two agree.
 
 ## FFmpeg gotchas (verified against ffmpeg 8.1)
 
@@ -92,6 +100,9 @@ These bit us once; re-check before changing download.py:
 - `dnxhd` refuses to encode without `-profile:v`; ProRes needs the pixel format its profile expects (`yuva444p10le` for 4444, `yuv422p10le` otherwise). See `CONV_INTRA_PROFILES`.
 - Scale filters use `w='min(iw,N)'` so "Resize" only ever downscales.
 - Trim: `-ss` goes **before** `-i` (seek instead of decode-and-discard); `-t` after `-i` is a *duration* relative to the trimmed start, not an absolute timestamp. `effective_duration` adjusts the progress denominator to match.
+- **`-af` can only be given once** — a second one silently replaces the first rather than adding to it. That is why every audio effect is merged into a single chain in [audio_filters.py](ytdlp_gui/audio_filters.py) instead of each feature appending its own.
+- Filter order in that chain is load-bearing: `pan` → pitch → `atempo` → `loudnorm`. Pitch is shifted by resampling (`aresample,asetrate,aresample`), which changes speed too, so the tempo factor divides that back out. `atempo` only accepts 0.5–2.0, so anything outside is split into stages. `loudnorm` must be last because it measures whatever it is handed.
+- **ffprobe and ffplay are found with `sibling_tool(ffmpeg_path, …)`, never by bare name.** Preferences → Tools can point at an ffmpeg that is not on PATH, and then a bare `ffprobe` resolves to nothing — which surfaced as "could not read this media".
 
 ## Settings and panels
 
@@ -107,7 +118,9 @@ These bit us once; re-check before changing download.py:
 - **Widget helpers** in [widgets.py](ytdlp_gui/widgets.py) (`section`, `entry`, `check`, `labeled_combo`, `labeled_entry`, `mini_combo`, `mini_entry`, `browse_row`) keep the panels consistent — reuse them rather than rolling new styling.
 - **Re-showing a hidden frame needs an explicit `after=` anchor.** A bare `pack()` appends to the end of the parent, so a toggled frame jumps to the bottom of the panel.
 - **Cards** in the queue/converter use the `_tint` / `_conv_tint` pattern to recolor a card and all non-ttk children at once when status changes.
-- **Status changes are pushed via `msg_q.put(('update', item))`** — `_handle()` is the single dispatch point for queue messages.
+- **Status changes are pushed via `msg_q.put(('update', item))`** — `_handle()` is the single dispatch point for queue messages. The other kinds are `prog`, `pp`, `file` (a finished path from `post_hooks`), `meta` (a background title lookup), `note_error`, `log`, `status`, `show_info`, `show_playlist`, `conv_update` and `update_result`.
+- **Per-item actions live on the card's right-click menu** (`_post_card_menu`), not on buttons. Open, Show in folder, Send to Converter, Copy URL, Edit/Clear clip range, Duplicate, Retry, Remove. Adding six buttons per row would make the queue unreadable.
+- **Repeating `after` timers check `self._closing`** before rescheduling. `_poll` and `_watch_clipboard` both re-arm themselves, and a callback in flight during `destroy()` would otherwise queue another against a dead window and print a Tk "invalid command name" error on exit.
 
 ## Syncing the vendored yt-dlp
 
@@ -128,8 +141,12 @@ python check_sync.py               # MUST pass before trusting the merge
 - **[check_sync.py](check_sync.py) is the point of the exercise.** A renamed
   option or a re-ordered postprocessor is accepted by `YoutubeDL` in silence and
   simply stops working; the GUI keeps running and quietly does the wrong thing.
-  The script asserts every assumption in the two "gotchas" sections above and
-  encodes all 16 converter formats with the real ffmpeg.
+  The script asserts every assumption in the two "gotchas" sections above. With
+  ffmpeg present it also encodes all 16 converter formats and every
+  `CONV_PRESETS` entry for real, runs each practice filter chain, and replays
+  the exact `-acodec copy` command shape yt-dlp builds for all eight audio
+  targets — that last one is what catches the stream-copy filter failure, which
+  no amount of option inspection would reveal.
 
 ## Files that are NOT ours
 

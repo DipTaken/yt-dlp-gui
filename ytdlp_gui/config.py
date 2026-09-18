@@ -24,7 +24,7 @@ def _project_root() -> str:
 ROOT = _project_root()
 
 SETTINGS_FILE = os.path.join(ROOT, 'gui_settings.json')
-SETTINGS_SCHEMA_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 3
 
 # Resolution caps are expressed through yt-dlp's format *sorting* (`-S res:N`)
 # rather than through a `[height<=N]` filter. A filter makes the download fail
@@ -92,6 +92,43 @@ SB_MODES = ['Mark as chapters', 'Remove from file']
 # Subtitle conversion targets. SRT is what every NLE and transcription tool
 # reads; YouTube hands out VTT by default.
 SUB_FORMATS = ['(keep original)', 'srt', 'ass', 'vtt', 'lrc']
+
+# Audio extraction targets. This list must stay a subset of
+# FFmpegExtractAudioPP.SUPPORTED_EXTS — 'ogg' is *not* one of them (the codec
+# is called 'vorbis'; picking 'ogg' raised a KeyError deep in the postprocessor
+# and lost the download). check_sync asserts the two agree.
+AUDIO_FORMATS = ['mp3', 'aac', 'm4a', 'flac', 'wav', 'opus', 'vorbis', 'alac']
+
+# ACODECS gives no encoder for these two, so an explicit -c:a has to be
+# supplied whenever we add our own filters (see download.py).
+AUDIO_ENCODER_OVERRIDES = {'alac': 'alac', 'wav': 'pcm_s16le'}
+
+# ── Practice controls (transcription) ────────────────────────────────────────
+# Slowing a solo down without dropping its pitch is the one thing every
+# transcription tool does; transposing covers capos and Bb/Eb instruments.
+AUDIO_TEMPO_CHOICES = ['50', '60', '65', '70', '75', '80', '85', '90', '100']
+AUDIO_TRANSPOSE_CHOICES = [str(n) for n in range(-12, 13)]
+
+# label -> ffmpeg `pan` filter. Isolating one side pulls an instrument out of
+# an old hard-panned stereo mix.
+AUDIO_CHANNEL_MODES: dict[str, str] = {
+    'Stereo':      '',
+    'Mono (mix)':  'pan=mono|c0=0.5*c0+0.5*c1',
+    'Left only':   'pan=mono|c0=c0',
+    'Right only':  'pan=mono|c0=c1',
+}
+
+# Appended to the filename template when a clip range is set, so two sections
+# of the same video do not collide. yt-dlp fills section_start/section_end for
+# every download_ranges download; `|end` covers an open-ended range.
+CLIP_SUFFIX_TMPL = (' [clip %(section_start>%Hh%Mm%Ss)s-'
+                    '%(section_end>%Hh%Mm%Ss|end)s]')
+
+# Injected into the `chapter` output template, which is what
+# FFmpegSplitChaptersPP renders each piece through.
+CHAPTER_SUFFIX_TMPL = ' - %(section_number)03d %(section_title)s'
+
+FFMPEG_DOWNLOAD_URL = 'https://www.gyan.dev/ffmpeg/builds/'
 
 # Filename layouts. yt-dlp template syntax: `a,b` = use first available field,
 # `|x` = literal fallback, `>fmt` = strftime for date fields.
@@ -188,6 +225,11 @@ CONV_PRESETS: dict[str, dict] = {
                                          loud='-14 LUFS (streaming)'),
     'MP3 — Podcast loudness':       dict(type='Audio', fmt='MP3',  aq='192',
                                          loud='-16 LUFS (podcast)'),
+    # ── Practice / transcription ─────────────────────────────────────────────
+    'Practice — MP3 at 75% speed':  dict(type='Audio', fmt='MP3', aq='192', tempo='75'),
+    'Practice — MP3 at 50% speed':  dict(type='Audio', fmt='MP3', aq='192', tempo='50'),
+    'Practice — left channel only': dict(type='Audio', fmt='MP3', aq='192',
+                                         channels='Left only'),
     # ── Delivery ─────────────────────────────────────────────────────────────
     'MP4 H.264 — High Quality':     dict(type='Video', fmt='MP4 (H.264)',      crf='18'),
     'MP4 H.264 — Balanced':         dict(type='Video', fmt='MP4 (H.264)',      crf='23'),
@@ -269,6 +311,9 @@ DEFAULT_SETTINGS = {
     'audio_quality':        '192',
     'audio_normalize':      False,
     'audio_sample_rate':    '',
+    'audio_tempo':          '100',
+    'audio_transpose':      '0',
+    'audio_channels':       'Stereo',
     'keep_video':           False,
     'music_tags':           False,
     'embed_thumbnail':      True,
@@ -301,6 +346,10 @@ DEFAULT_SETTINGS = {
     'cookie_browser':       '',
     'cookie_file':          '',
     'ffmpeg_path':          '',   # '' means "auto-detect"
+    'post_convert_preset':  '',   # '' means "leave the downloaded file alone"
+    'watch_clipboard':      False,
+    # Items left unfinished at close, restored (never auto-started) next launch
+    'queue_snapshot':       [],
     # Converter
     'conv_output_dir':      str(Path.home() / 'Downloads'),
     'conv_format_type':     'Audio',
@@ -311,6 +360,9 @@ DEFAULT_SETTINGS = {
     'conv_fps':             '(keep original)',
     'conv_scale':           '(keep original)',
     'conv_loudness':        'Off',
+    'conv_tempo':           '100',
+    'conv_transpose':       '0',
+    'conv_channels':        'Stereo',
     'conv_trim_start':      '',
     'conv_trim_end':        '',
     'conv_overwrite':       True,
@@ -340,7 +392,14 @@ def migrate_settings(data: dict, from_version: int) -> dict:
         if data.get('format_preset') not in FORMAT_PRESETS:
             data['format_preset'] = DEFAULT_SETTINGS['format_preset']
         from_version = 2
-    # Future: if from_version < 3: ...
+    # v2 -> v3: 'ogg' was offered as an audio-extraction target, but yt-dlp
+    # calls that codec 'vorbis' and blew up on the unknown key. Anyone who had
+    # it selected gets the format they actually meant.
+    if from_version < 3:
+        if data.get('audio_format') == 'ogg':
+            data['audio_format'] = 'vorbis'
+        from_version = 3
+    # Future: if from_version < 4: ...
     return data
 
 
@@ -373,3 +432,35 @@ def save_settings(settings: dict):
             json.dump(settings, f, indent=2)
     except OSError:
         pass
+
+
+def apply_conv_preset(settings: dict, name: str) -> dict:
+    """Return a copy of `settings` with one converter preset applied.
+
+    Pure, so the download -> convert chain can apply a preset to a throwaway
+    dict without touching (or being touched by) whatever the Converter tab
+    happens to be showing.
+
+    Quality keys a preset omits keep their current value; the *filters* always
+    reset. A preset that says nothing about speed means "normal speed", not
+    "whatever was left over from the last job".
+    """
+    cfg = CONV_PRESETS.get(name)
+    if not cfg:
+        return dict(settings)
+    s = dict(settings)
+    s['conv_format_type']   = cfg['type']
+    s['conv_output_format'] = cfg['fmt']
+    if 'aq' in cfg:
+        s['conv_audio_quality'] = cfg['aq']
+    if 'crf' in cfg:
+        s['conv_video_crf'] = cfg['crf']
+    if 'profile' in cfg:
+        s['conv_intra_profile'] = cfg['profile']
+    s['conv_scale']     = cfg.get('scale', '(keep original)')
+    s['conv_fps']       = cfg.get('fps', '(keep original)')
+    s['conv_loudness']  = cfg.get('loud', 'Off')
+    s['conv_tempo']     = cfg.get('tempo', '100')
+    s['conv_transpose'] = cfg.get('transpose', '0')
+    s['conv_channels']  = cfg.get('channels', 'Stereo')
+    return s

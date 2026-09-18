@@ -7,7 +7,9 @@ The ffmpeg gotchas encoded here are documented in CLAUDE.md.
 """
 from yt_dlp.utils import parse_duration
 
+from .audio_filters import build_audio_filter_chain, practice_suffix
 from .config import (
+    AUDIO_CHANNEL_MODES,
     CONV_FORMAT_INFO,
     CONV_INTRA_PROFILES,
     CONV_LOSSLESS,
@@ -15,6 +17,20 @@ from .config import (
     CONV_SCALE_CHOICES,
 )
 from .download import int_or_none
+
+
+def conv_name_suffix(s: dict) -> str:
+    """' [75% speed]' for the output filename, or ''.
+
+    Only ever non-empty for an audio target, matching where the practice
+    filters are actually applied, so a converted video never picks up a suffix
+    describing something that did not happen.
+    """
+    info = CONV_FORMAT_INFO.get(s.get('conv_output_format', ''))
+    if not info or info[1] != 'audio':
+        return ''
+    return practice_suffix(s.get('conv_tempo', '100'),
+                           s.get('conv_transpose', '0'))
 
 
 def parse_time(raw, label: str, warn) -> 'float | None':
@@ -89,9 +105,20 @@ def build_conv_args(s: dict, warn, error) -> 'tuple[list, list, str] | None':
         out_args += ['-r', fps, '-fps_mode', 'cfr']
 
     # ── Audio filters ────────────────────────────────────────────────────
+    # One merged chain, because a second -af silently replaces the first
+    # rather than adding to it. Tempo and pitch are audio-target only: speeding
+    # up the audio under a video stream nobody asked to retime just walks the
+    # two out of sync.
     loud = CONV_LOUDNESS.get(s.get('conv_loudness', 'Off'), '')
-    if loud:
-        out_args += ['-af', f'loudnorm={loud}']
+    audio_only = kind == 'audio'
+    chain = build_audio_filter_chain(
+        s.get('conv_tempo', '100') if audio_only else 100,
+        s.get('conv_transpose', '0') if audio_only else 0,
+        AUDIO_CHANNEL_MODES.get(s.get('conv_channels', 'Stereo'), '')
+        if audio_only else '',
+        loud)
+    if chain:
+        out_args += ['-af', chain]
 
     # ── Stream selection ─────────────────────────────────────────────────
     # Audio targets must drop the video stream, otherwise converting a video

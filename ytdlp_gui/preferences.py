@@ -13,13 +13,14 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, ttk
 
-from .config import SETTINGS_FILE
+from .config import FFMPEG_DOWNLOAD_URL, SETTINGS_FILE
 from .ffmpeg_utils import find_ffmpeg
 from .theme import (
-    BASE, GREEN, MANTLE, MAUVE, OVL0, RED, SUBT0, SURF0, SURF1, SURF2, TEXT,
-    YELLOW, apply_dark_titlebar,
+    BASE, BLUE, GREEN, MANTLE, MAUVE, OVL0, RED, SUBT0, SURF0, SURF1, SURF2,
+    TEXT, YELLOW, apply_dark_titlebar,
 )
 from .widgets import WheelRouter, browse_row, check, entry, labeled_combo, labeled_entry, mini_entry
 
@@ -128,6 +129,13 @@ class PreferencesWindow(tk.Toplevel):
         browse_row(p, 'Archive file (blank = archive.txt in the output folder)',
                    a.archive_file_var, self._browse_archive)
 
+        self._head(p, 'BEHAVIOUR')
+        check(p, 'Watch the clipboard for links', a.watch_clip_var)
+        tk.Label(p, text='Copying a link anywhere adds it to the queue. It is '
+                         'only ever queued, never started on its own.',
+                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8), wraplength=520,
+                 justify='left').pack(anchor='w', padx=16, pady=(1, 0))
+
     def _build_network(self, p):
         a = self.app
         self._head(p, 'BANDWIDTH')
@@ -201,6 +209,18 @@ class PreferencesWindow(tk.Toplevel):
                           else 'Not found on PATH or in the usual install folders'),
                  bg=MANTLE, fg=GREEN if detected else YELLOW, font=('Segoe UI', 8),
                  wraplength=520, justify='left').pack(anchor='w', padx=16, pady=(4, 0))
+        if not detected and not a.settings.get('ffmpeg_path'):
+            # Without ffmpeg most of the app quietly does nothing useful, so
+            # say where to get it rather than leaving the user to search.
+            tk.Button(p, text='Download FFmpeg →', command=self._open_ffmpeg_site,
+                      bg=MANTLE, fg=BLUE, font=('Segoe UI', 9, 'underline'),
+                      relief='flat', bd=0, cursor='hand2',
+                      activebackground=MANTLE, activeforeground=BLUE,
+                      padx=0, pady=2).pack(anchor='w', padx=14, pady=(2, 0))
+            tk.Label(p, text='Unzip it anywhere, then point the box above at '
+                             'ffmpeg.exe — or drop it next to this app.',
+                     bg=MANTLE, fg=SURF2, font=('Segoe UI', 8), wraplength=520,
+                     justify='left').pack(anchor='w', padx=16)
         self._ffmpeg_status = tk.Label(p, text='', bg=MANTLE, fg=SUBT0,
                                        font=('Segoe UI', 8), wraplength=520,
                                        justify='left')
@@ -242,6 +262,12 @@ class PreferencesWindow(tk.Toplevel):
             filetypes=[('Cookie files', '*.txt'), ('All files', '*.*')])
         if path:
             self.app.cookie_file_var.set(path)
+
+    def _open_ffmpeg_site(self):
+        try:
+            webbrowser.open(FFMPEG_DOWNLOAD_URL)
+        except Exception as exc:
+            self.app._log(f'[ERR]  Could not open the browser: {exc}\n', 'red')
 
     def _browse_ffmpeg(self):
         path = filedialog.askopenfilename(
