@@ -27,13 +27,18 @@ PEACH  = '#fab387'
 
 def apply_dark_titlebar(win):
     """Ask DWM for a dark title bar. No-op off Windows / on older builds."""
-try:
-    import ctypes
-    hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
-    ctypes.windll.dwmapi.DwmSetWindowAttribute(
-        hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
-except Exception:
-    pass
+    try:
+        import ctypes
+        win.update_idletasks()      # the native window must exist for GetParent
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        val = ctypes.c_int(1)
+        # 20 is the documented attribute; 19 is what pre-20H1 Windows 10 used.
+        for attr in (20, 19):
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
+                break
+    except Exception:
+        pass
 
 
 def build_styles(root):
@@ -54,11 +59,25 @@ def build_styles(root):
            selectbackground=[('!focus', SURF0)],
            bordercolor=[('focus', MAUVE), ('!focus', SURF1)])
 
+    # Dropdown lists are plain Tk listboxes, which ignore ttk styles.
+    root.option_add('*TCombobox*Listbox.background', SURF0)
+    root.option_add('*TCombobox*Listbox.foreground', TEXT)
+    root.option_add('*TCombobox*Listbox.selectBackground', MAUVE)
+    root.option_add('*TCombobox*Listbox.selectForeground', CRUST)
+
     # Checkbutton
     st.configure('TCheckbutton', background=MANTLE, foreground=TEXT,
                  focuscolor='', indicatorcolor=SURF1)
     st.map('TCheckbutton',
            background=[('active', MANTLE)],
+           foreground=[('active', TEXT)],
+           indicatorcolor=[('selected', MAUVE), ('!selected', SURF1)])
+
+    # Same, for checkbuttons sitting on BASE rather than the MANTLE panels.
+    st.configure('Base.TCheckbutton', background=BASE, foreground=TEXT,
+                 focuscolor='', indicatorcolor=SURF1)
+    st.map('Base.TCheckbutton',
+           background=[('active', BASE)],
            foreground=[('active', TEXT)],
            indicatorcolor=[('selected', MAUVE), ('!selected', SURF1)])
 
@@ -88,6 +107,7 @@ def build_styles(root):
                  borderwidth=0)
     st.configure('Treeview.Heading', background=MANTLE, foreground=MAUVE,
                  font=('Segoe UI', 9, 'bold'), borderwidth=0)
+    st.map('Treeview.Heading', background=[('active', SURF0)])
     st.map('Treeview',
            background=[('selected', MAUVE)],
            foreground=[('selected', CRUST)])

@@ -21,7 +21,9 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from yt_dlp import YoutubeDL
+import yt_dlp
 from yt_dlp.postprocessor import FFmpegExtractAudioPP, MetadataParserPP
+from yt_dlp.postprocessor.ffmpeg import FFmpegCopyStreamPP
 from yt_dlp.postprocessor.ffmpeg import ACODECS
 from yt_dlp.version import __version__ as YTDLP_VERSION
 
@@ -29,7 +31,9 @@ from ytdlp_gui import config
 from ytdlp_gui.audio_filters import build_audio_filter_chain
 from ytdlp_gui.convert import build_conv_args
 from ytdlp_gui.download import audio_encoder_for, build_ydl_opts, parse_clip_range
-from ytdlp_gui.ffmpeg_utils import find_ffmpeg, no_window_kwargs
+from ytdlp_gui.ffmpeg_utils import (
+    effective_duration, find_ffmpeg, no_window_kwargs, sibling_tool,
+)
 from ytdlp_gui.models import DownloadItem
 
 FAILS = []
@@ -190,10 +194,16 @@ print()
 print('=== postprocessor_args key lookup ===')
 o = opts_for(audio_extract=True, audio_normalize=True, audio_sample_rate='48000')
 y = YoutubeDL({'quiet': True, 'postprocessor_args': o.get('postprocessor_args', {})})
-got = FFmpegExtractAudioPP(y)._configuration_args('ffmpeg')
+got = FFmpegCopyStreamPP(y)._configuration_args('ffmpeg')
 y.close()
-check('yt-dlp actually receives the audio args',
-      got == ['-c:a', 'libmp3lame', '-af', 'loudnorm', '-ar', '48000'], got)
+check('yt-dlp actually receives the practice args under "copystream"',
+      got == ['-c:a', 'libmp3lame', '-b:a', '192k', '-af', 'loudnorm,aresample=48000',
+              '-ar', '48000'], got)
+check('the practice pass is a FFmpegCopyStream after ExtractAudio',
+      [p['key'] for p in o['postprocessors']].index('FFmpegCopyStream')
+      > [p['key'] for p in o['postprocessors']].index('FFmpegExtractAudio'))
+check('ExtractAudio itself gets no extra args (it skips them on a copy)',
+      'extractaudio' not in o.get('postprocessor_args', {}))
 
 print()
 print('=== audio extraction targets exist upstream ===')
@@ -210,7 +220,7 @@ check('an old "ogg" setting migrates to vorbis',
 # encoder blank for wav/alac, and a blank -c:a would be a broken command line.
 for fmt in config.AUDIO_FORMATS:
     args = opts_for(audio_extract=True, audio_format=fmt,
-                    audio_tempo='75')['postprocessor_args']['extractaudio']
+                    audio_tempo='75')['postprocessor_args']['copystream']
     check(f'{fmt} filters carry an explicit encoder',
           args[0] == '-c:a' and args[1] == audio_encoder_for(fmt), args[:2])
 
@@ -268,6 +278,84 @@ check('the sidebar boxes alone do not clip anything',
       'download_ranges' not in opts_for(clip_start='1:30', clip_end='2:45'))
 
 print()
+print('=== cookie browser parsing ===')
+from ytdlp_gui.download import network_opts
+_w = []
+_cb = network_opts({'cookie_browser': 'Firefox+gnomekeyring:default'}, _w.append).get('cookiesfrombrowser')
+check('keyring is upper-cased', _cb == ('firefox', 'default', 'GNOMEKEYRING'), _cb)
+_cb = network_opts({'cookie_browser': 'netscape'}, _w.append)
+check('unknown cookie browser skipped with a warning',
+      'cookiesfrombrowser' not in _cb and len(_w) == 1, _w)
+
+print()
+print('=== parity with the yt-dlp CLI ===')
+# parse_options is the oracle: it is what `yt-dlp ...` itself would build. An
+# explicit argv is always passed (None would read the user's config files).
+def _cli(argv):
+    return yt_dlp.parse_options(argv).ydl_opts
+
+
+def _pp_keys(o):
+    return [p['key'] for p in o['postprocessors'] if p.get('when') != 'playlist']
+
+
+for label, argv, over in (
+    ('audio + thumbnail + metadata + sponsorblock + split',
+     ['-x', '--audio-format', 'mp3', '--embed-thumbnail', '--embed-metadata',
+      '--limit-rate', '2M', '--max-filesize', '500M',
+      '--sponsorblock-mark', 'all', '--split-chapters'],
+     dict(audio_extract=True, audio_format='mp3', embed_thumbnail=True,
+          embed_metadata=True, rate_limit='2M', max_filesize='500M',
+          sponsorblock_enabled=True, split_chapters=True)),
+    ('embed subtitles + metadata',
+     ['--write-subs', '--embed-subs', '--embed-metadata'],
+     dict(write_subs=True, embed_subs=True, embed_metadata=True,
+          embed_thumbnail=False)),
+    ('plain video',
+     ['--embed-metadata'], dict(embed_thumbnail=False, embed_metadata=True)),
+):
+    cli = _cli(argv)
+    ours = opts_for(**over)
+    check(f'{label}: same postprocessor sequence',
+          _pp_keys(cli) == _pp_keys(ours), f'{_pp_keys(cli)} vs {_pp_keys(ours)}')
+    for key in ('writethumbnail', 'final_ext', 'ratelimit', 'max_filesize',
+                'ignoreerrors'):
+        check(f'{label}: {key}', cli.get(key) == ours.get(key),
+              f'{cli.get(key)!r} vs {ours.get(key)!r}')
+    check(f'{label}: pl_thumbnail',
+          (cli['outtmpl'].get('pl_thumbnail') or None)
+          == (ours['outtmpl'].get('pl_thumbnail') or None),
+          f"{cli['outtmpl'].get('pl_thumbnail')!r} vs {ours['outtmpl'].get('pl_thumbnail')!r}")
+
+print()
+print('=== settings that used to be silently wrong ===')
+WARNINGS.clear()
+o = opts_for(embed_thumbnail=True, audio_extract=True, audio_format='wav')
+check('a wav target drops thumbnail embedding instead of failing the item',
+      'EmbedThumbnail' not in _pp_keys(o) and WARNINGS, WARNINGS[:1])
+o = opts_for(audio_extract=True, audio_format='opus', audio_sample_rate='44100',
+             audio_normalize=True)
+args = o['postprocessor_args']['copystream']
+check('opus cannot be 44.1 kHz, so it is bumped to 48000',
+      args[args.index('-ar') + 1] == '48000', args)
+o = opts_for(audio_extract=True, audio_tempo='50', sponsorblock_enabled=True,
+             split_chapters=True)
+meta = next(p for p in o['postprocessors'] if p['key'] == 'FFmpegMetadata')
+check('a speed change stops chapters being written and split',
+      meta['add_chapters'] is False and 'FFmpegSplitChapters' not in _pp_keys(o)
+      and '-map_chapters' in o['postprocessor_args']['copystream'])
+o = opts_for(sponsorblock_enabled=True, embed_metadata=False)
+meta = [p for p in o['postprocessors'] if p['key'] == 'FFmpegMetadata']
+check('marking SponsorBlock chapters works with Embed Metadata off',
+      meta and meta[0]['add_metadata'] is False and meta[0]['add_chapters'] is True)
+check('"hook" is a SponsorBlock category we offer', 'hook' in config.SB_CATEGORIES)
+check('keep-original-video downloads the video as well',
+      opts_for(audio_extract=True, keep_video=True)['format'] != 'ba/b')
+check('2MB / 500MiB and dashed dates are understood',
+      opts_for(rate_limit='2MB').get('ratelimit') == 2000000
+      and 'daterange' in opts_for(date_after='2024-01-01'))
+
+print()
 print('=== every option combination constructs ===')
 bad = []
 for audio, split, sb, tags, clip in itertools.product((0, 1), repeat=5):
@@ -313,7 +401,7 @@ else:
         detail = ''
         if ok:
             p = subprocess.run(
-                ['ffprobe', '-v', 'error', '-show_entries',
+                [sibling_tool(FF, 'ffprobe'), '-v', 'error', '-show_entries',
                  'stream=codec_type,codec_name,pix_fmt', '-of', 'json', out],
                 capture_output=True, text=True, **no_window_kwargs())
             streams = json.loads(p.stdout or '{}').get('streams', [])
@@ -357,29 +445,62 @@ else:
         check(f'chain {tempo}% {steps:+d}st {mode}', ok, tail)
 
     print()
-    print('=== audio filters survive a stream copy ===')
-    # ExtractAudio emits `-acodec copy` whenever the source is already in the
-    # target codec. Filters against a copied stream fail outright unless an
-    # explicit encoder comes with them — the exact shape yt-dlp builds.
+    print('=== practice filters really run, for every audio target ===')
+    # Drives the real postprocessors in the order the GUI chains them. The
+    # source is already in the target codec, which is the case where
+    # FFmpegExtractAudio does nothing and the filters used to be dropped.
+    from ytdlp_gui.ffmpeg_utils import probe_duration
     for fmt in config.AUDIO_FORMATS:
-        ext, encoder, more = ACODECS[fmt]
-        probe_src = os.path.join(work, f'copy_src.{ext}')
+        ext, encoder, _more = ACODECS[fmt]
+        d = os.path.join(work, f'pp_{fmt}')
+        os.makedirs(d, exist_ok=True)
+        src = os.path.join(d, f'in.{ext}')
         subprocess.run([FF, '-y', '-hide_banner', '-loglevel', 'error',
-                        '-f', 'lavfi', '-i', 'sine=f=440:d=1']
-                       + (['-c:a', encoder] if encoder else []) + [probe_src],
+                        '-f', 'lavfi', '-i', 'sine=f=440:d=2']
+                       + (['-c:a', encoder] if encoder else [])
+                       + (['-f', 'adts'] if fmt == 'aac' else []) + [src],
                        check=True, **no_window_kwargs())
-        extra = opts_for(audio_extract=True, audio_format=fmt,
-                         audio_normalize=True, audio_tempo='75'
-                         )['postprocessor_args']['extractaudio']
-        out = os.path.join(work, f'copy_out.{ext}')
-        r = subprocess.run([FF, '-hide_banner', '-nostdin', '-y', '-i', probe_src,
-                            '-vn', '-acodec', 'copy', *more,
-                            '-movflags', '+faststart', *extra, out],
-                           capture_output=True, text=True, encoding='utf-8',
-                           errors='replace', **no_window_kwargs())
-        ok = r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0
-        check(f'{fmt}: filters + stream copy', ok, '' if ok else
-              ((r.stderr or '').strip().splitlines() or ['?'])[-1][:90])
+        o = opts_for(audio_extract=True, audio_format=fmt, audio_tempo='50',
+                     audio_normalize=True, embed_thumbnail=False)
+        y = YoutubeDL({'quiet': True, 'ffmpeg_location': FF,
+                       'postprocessor_args': o['postprocessor_args']})
+        try:
+            info = {'filepath': src, 'ext': ext}
+            for step in o['postprocessors']:
+                if step['key'] == 'FFmpegExtractAudio':
+                    pp = FFmpegExtractAudioPP(y, preferredcodec=fmt,
+                                              preferredquality='192')
+                elif step['key'] == 'FFmpegCopyStream':
+                    pp = FFmpegCopyStreamPP(y)
+                else:
+                    continue
+                _, info = pp.run(info)
+            dur = probe_duration(FF, info['filepath'])
+            ok = 3.6 < dur < 4.6
+            detail = f'{dur:.2f}s from 2s at 50%'
+        except Exception as exc:
+            ok, detail = False, f'{type(exc).__name__}: {exc}'[:90]
+        finally:
+            y.close()
+        check(f'{fmt}: tempo 50% doubles the length', ok, detail)
+
+    print()
+    print('=== converter trim + tempo, and the progress denominator ===')
+    s = {**config.DEFAULT_SETTINGS, 'conv_output_format': 'WAV',
+         'conv_tempo': '50', 'conv_trim_start': '0', 'conv_trim_end': '1'}
+    in_a, out_a, ext = build_conv_args(s, WARNINGS.append, WARNINGS.append)
+    outp = os.path.join(work, 'trim.wav')
+    src2 = os.path.join(work, 'trim_src.wav')
+    subprocess.run([FF, '-y', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+                    '-i', 'sine=f=440:d=4', src2], check=True, **no_window_kwargs())
+    subprocess.run([FF, '-hide_banner', '-nostdin', '-y', *in_a, '-i', src2,
+                    *out_a, outp], capture_output=True, **no_window_kwargs())
+    got_len = probe_duration(FF, outp)
+    check('trimming 1 s at 50% speed gives a 2 s file', 1.9 < got_len < 2.1,
+          f'{got_len:.2f}s')
+    est = effective_duration(4.0, in_a, out_a)
+    check('the progress denominator is the output length', abs(est - got_len) < 0.15,
+          f'{est:.2f}s vs {got_len:.2f}s')
 
     import shutil
     shutil.rmtree(work, ignore_errors=True)

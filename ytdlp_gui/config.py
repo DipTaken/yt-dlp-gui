@@ -5,6 +5,7 @@ tooling can read it without a display.
 """
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -83,7 +84,7 @@ COMPAT_MODES: dict[str, dict] = {
 DEFAULT_COMPAT_MODE = 'Balanced (best resolution, MP4 if possible)'
 
 SB_CATEGORIES = ['all', 'sponsor', 'intro', 'outro', 'selfpromo',
-                  'interaction', 'music_offtopic', 'preview', 'filler']
+                  'interaction', 'music_offtopic', 'preview', 'filler', 'hook']
 
 # 'Mark' writes chapters you can skip manually; 'Remove' physically cuts the
 # segments out (needs a re-encode at the cut points to stay in sync).
@@ -345,6 +346,18 @@ DEFAULT_SETTINGS = {
     'date_before':          '',
     'cookie_browser':       '',
     'cookie_file':          '',
+    # Network / politeness extras (0 or '' = off). Honoured by download.py via
+    # .get(), so they work before any widget is wired to them.
+    'sleep_interval':          '0',
+    'max_sleep_interval':      '0',
+    'sleep_interval_requests': '0',
+    'playlist_items':          '',     # e.g. '1-10,15'
+    'socket_timeout':          '0',
+    'force_ipv4':              False,
+    'extractor_retries':       '',     # '' = yt-dlp default
+    'trim_file_name':          '',     # e.g. '180' to stay inside Windows path limits
+    'break_on_existing':       False,  # with the archive on: stop at the first known video
+    'thumbnail_to_jpg':        False,  # convert a kept thumbnail to jpg
     'ffmpeg_path':          '',   # '' means "auto-detect"
     'post_convert_preset':  '',   # '' means "leave the downloaded file alone"
     'watch_clipboard':      False,
@@ -415,11 +428,17 @@ def load_settings() -> dict:
         with open(SETTINGS_FILE, encoding='utf-8') as f:
             raw = json.load(f)
     except Exception:
+        # Keep the unreadable file so a hand-edit isn't lost to the next save.
+        try:
+            shutil.copy(SETTINGS_FILE, SETTINGS_FILE + '.corrupt')
+        except OSError:
+            pass
         return dict(DEFAULT_SETTINGS)
     if not isinstance(raw, dict):
         return dict(DEFAULT_SETTINGS)
 
-    raw = migrate_settings(raw, raw.get('schema_version', 0))
+    version = raw.get('schema_version')
+    raw = migrate_settings(raw, version if isinstance(version, int) else 0)
     merged = {**DEFAULT_SETTINGS, **raw}
     merged['schema_version'] = SETTINGS_SCHEMA_VERSION
     return merged
@@ -427,11 +446,18 @@ def load_settings() -> dict:
 
 def save_settings(settings: dict):
     """Best-effort write; a failure here must never interrupt a download."""
+    # Write beside the target and swap in, so a crash mid-write can't leave a
+    # truncated file that load_settings would then discard.
+    tmp = SETTINGS_FILE + '.tmp'
     try:
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(settings, f, indent=2)
-    except OSError:
-        pass
+        os.replace(tmp, SETTINGS_FILE)
+    except (OSError, TypeError, ValueError):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def apply_conv_preset(settings: dict, name: str) -> dict:

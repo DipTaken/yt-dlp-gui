@@ -11,12 +11,14 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadCancelled, format_bytes
+from yt_dlp.version import __version__ as YTDLP_VERSION
 
 from .clip_editor import ClipEditor
 from .config import (
@@ -31,7 +33,7 @@ from .config import (
 from .convert import build_conv_args, conv_name_suffix, parse_time
 from .download import (
     build_format_opts, build_postprocessors, build_ydl_opts, int_or_none,
-    parse_clip_range,
+    network_opts, parse_clip_range,
 )
 from .ffmpeg_utils import (
     effective_duration, find_ffmpeg, iter_ffmpeg_chunks, probe_duration,
@@ -59,11 +61,24 @@ class App(tk.Tk):
         self.configure(bg=BASE)
         self._apply_dark_titlebar(self)
 
+        # The default icon is inherited by every Toplevel too. Frozen builds
+        # unpack icon.ico to _MEIPASS; from source it sits in the project root.
+        try:
+            self.iconbitmap(default=os.path.join(
+                getattr(sys, '_MEIPASS', ROOT), 'icon.ico'))
+        except Exception:
+            pass
+
         self.settings = self._load_settings()
-        self.geometry(self.settings.get('window_geometry') or '1200x760')
+        self.geometry(self._saved_geometry())
         self.items: dict[str, DownloadItem] = {}
         self.msg_q: queue.Queue = queue.Queue()
         self._threads: dict[str, threading.Thread] = {}
+        # Open clip editors by item id, so a second double-click raises the
+        # existing one instead of stacking another.
+        self._clip_editors: dict = {}
+        self._fetching = False
+        self._was_busy = False
         self._dl_slot: 'threading.Semaphore | None' = None
         self._dl_slot_size = 0
         self._conv_slot: 'threading.Semaphore | None' = None
@@ -97,47 +112,112 @@ class App(tk.Tk):
         # has even pressed Download.
         self._title_slot = threading.Semaphore(2)
         # Clipboard watcher state (opt-in, see Preferences → Files).
-        self._clip_last = None
+        # Seeded with whatever is already on the clipboard, so enabling the
+        # watcher does not queue a link copied long before.
+        try:
+            self._clip_last = self.clipboard_get().strip()
+        except Exception:
+            self._clip_last = ''
         self._clip_ignore = ''
 
         # Routes the wheel to whichever scrollable canvas the cursor is over.
         self._wheel = WheelRouter(self)
 
         self._build_styles()
+        # A Combobox's class binding changes its value on every wheel tick, so
+        # scrolling a sidebar past one silently edited a setting.
+        self.bind_class('TCombobox', '<MouseWheel>', lambda _e: None)
         self._create_setting_vars()
         self._build_ui()
         self._bind_shortcuts()
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+        if self.settings.get('window_zoomed'):
+            try:
+                self.state('zoomed')
+            except tk.TclError:
+                pass
         self._restore_queue()
         self._poll()
         self._watch_clipboard()
 
+    def _saved_geometry(self) -> str:
+        """The remembered window geometry, pulled back on screen.
+
+        A monitor that was unplugged since the last run would otherwise
+        restore the window somewhere unreachable.
+        """
+        default = '1200x760'
+        m = re.match(r'^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$',
+                     self.settings.get('window_geometry') or '')
+        if not m:
+            return default
+        w, h, x, y = (int(g) for g in m.groups())
+        vx, vy = self.winfo_vrootx(), self.winfo_vrooty()
+        vw, vh = self.winfo_vrootwidth(), self.winfo_vrootheight()
+        w, h = min(w, vw), min(h, vh)
+        x = min(max(x, vx), max(vx + vw - 200, vx))
+        y = min(max(y, vy), max(vy + vh - 120, vy))
+        return f'{w}x{h}+{x}+{y}'
+
     def _bind_shortcuts(self):
         """App-wide keyboard shortcuts. Most ignore Entry/Text focus so typing
-        in a field doesn't trigger them."""
+        in a field doesn't trigger them, and all of them ignore other windows
+        (Preferences, popups) — bind_all would otherwise fire Delete there."""
         def is_text_widget(w):
             try:
-                return w.winfo_class() in ('Entry', 'TEntry', 'Text', 'TCombobox')
+                return w.winfo_class() in ('Entry', 'TEntry', 'Text', 'TCombobox',
+                                           'Spinbox', 'TSpinbox', 'Treeview',
+                                           'Listbox')
             except Exception:
                 return False
 
         def guarded(action):
             def handler(e):
-                if is_text_widget(self.focus_get()):
+                try:
+                    w = self.focus_get()
+                except KeyError:        # focus is on a popdown listbox
+                    return None
+                if (w is None or w.winfo_toplevel() is not self
+                        or is_text_widget(w)):
                     return None
                 action()
                 return 'break'
             return handler
 
+        def focus_url():
+            self._url_focus_in(None)
+            self.url_entry.focus_set()
+            self.url_entry.select_range(0, 'end')
+            return 'break'
+
+        def add_files():
+            if self._nb.select() == str(self._conv_tab):
+                self._add_conv_files()
+
         # Ctrl+L → focus URL bar (works even from a text widget)
-        self.bind_all('<Control-l>', lambda _e: (self.url_entry.focus_set(),
-                                                  self.url_entry.select_range(0, 'end'),
-                                                  'break')[-1])
+        self.bind_all('<Control-l>', lambda _e: focus_url())
         # Ctrl+D → download selected
         self.bind_all('<Control-d>', guarded(self._download_selected))
         # Delete / Ctrl+Backspace → remove selected
         self.bind_all('<Delete>',           guarded(self._remove_selected))
         # Ctrl+A in queue area → select-all checkboxes (when not in a text widget)
         self.bind_all('<Control-a>',        guarded(self._select_all))
+        # Ctrl+V outside a field → queue whatever links are on the clipboard
+        self.bind_all('<Control-v>',        guarded(self._queue_clipboard))
+        self.bind_all('<Control-r>',        guarded(self._retry_failed))
+        self.bind_all('<Control-o>',        guarded(add_files))
+
+    def _queue_clipboard(self):
+        try:
+            text = self.clipboard_get().strip()
+        except tk.TclError:
+            text = ''
+        urls = [u for u in self._split_urls(text) if re.match(r'^https?://', u)]
+        if not urls:
+            self.status_var.set('No links on the clipboard.')
+            return
+        ids = self._queue_urls(urls)
+        self._log(f'Added {len(ids)} URL(s) from the clipboard.\n', 'blue')
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _apply_dark_titlebar(self, win):
@@ -160,13 +240,36 @@ class App(tk.Tk):
     def _save_settings_now(self):
         """Collect current UI values, save to disk, flash status."""
         self._collect_settings()
-        self.status_var.set('Settings saved as defaults.')
-        self._log('Settings saved as defaults.\n', 'blue')
+        self.status_var.set('Settings saved.')
+        self._log('Settings saved.\n', 'blue')
+
+    # Configured once in Preferences, so the sidebar's Reset leaves them alone:
+    # wiping a proxy or cookie source from a button that looks like it only
+    # touches format options would be a nasty surprise.
+    _PREFS_KEYS = frozenset({
+        'archive_enabled', 'archive_file', 'rate_limit', 'proxy', 'retries',
+        'concurrent_fragments', 'max_concurrent', 'no_playlist', 'max_filesize',
+        'date_after', 'date_before', 'cookie_browser', 'cookie_file',
+        'watch_clipboard', 'sleep_interval', 'max_sleep_interval',
+        'sleep_interval_requests', 'playlist_items', 'socket_timeout',
+        'force_ipv4', 'extractor_retries', 'trim_file_name',
+        'break_on_existing', 'thumbnail_to_jpg'})
 
     def _reset_settings(self):
-        """Restore all download-tab settings to DEFAULT_SETTINGS values."""
+        """Restore the sidebar's settings to DEFAULT_SETTINGS values."""
+        if not messagebox.askyesno(
+                'Reset settings',
+                'Reset the sidebar options to their defaults?\n\n'
+                'Network, cookies, filters and other Preferences are kept.',
+                parent=self):
+            return
         for key, var in self._setting_var_map():
-            var.set(DEFAULT_SETTINGS[key])
+            if key in self._PREFS_KEYS or key == 'template_preset':
+                continue    # the preset follows the template via its trace
+            value = DEFAULT_SETTINGS[key]
+            if key == 'post_convert_preset' and not value:
+                value = '(nothing)'
+            var.set(value)
         # Refresh dependent sub-frames
         self._on_format_change()
         self._on_compat_change()
@@ -184,7 +287,17 @@ class App(tk.Tk):
         self._build_header()
         tk.Frame(self, bg=SURF1, height=1).pack(fill='x')
 
-        nb = ttk.Notebook(self)
+        # The log sits in its own pane so it can be dragged taller when a
+        # download is misbehaving.
+        paned = tk.PanedWindow(self, orient='vertical', bg=SURF1, bd=0,
+                               sashwidth=5, sashrelief='flat')
+        paned.pack(fill='both', expand=True)
+        top = tk.Frame(paned, bg=BASE)
+        log_pane = tk.Frame(paned, bg=MANTLE)
+        paned.add(top, stretch='always', minsize=360)
+        paned.add(log_pane, stretch='never', minsize=60)
+
+        nb = ttk.Notebook(top)
         nb.pack(fill='both', expand=True)
         self._nb = nb          # kept so actions can switch tabs
 
@@ -203,8 +316,8 @@ class App(tk.Tk):
         self._conv_tab = conv_tab
         self._build_converter_tab(conv_tab)
 
-        tk.Frame(self, bg=SURF1, height=1).pack(fill='x')
-        self._build_bottom()
+        tk.Frame(top, bg=SURF1, height=1).pack(fill='x')
+        self._build_bottom(top, log_pane)
 
     # ─── Header ──────────────────────────────────────────────────────────────
     def _build_header(self):
@@ -214,7 +327,7 @@ class App(tk.Tk):
         # Logo
         tk.Label(hdr, text='YT-DLP GUI', bg=MANTLE, fg=MAUVE,
                  font=('Segoe UI', 14, 'bold')).pack(side='left', padx=(16, 6), pady=12)
-        tk.Label(hdr, text='v2026.03', bg=MANTLE, fg=OVL0,
+        tk.Label(hdr, text=f'yt-dlp {YTDLP_VERSION}', bg=MANTLE, fg=OVL0,
                  font=('Segoe UI', 9)).pack(side='left', pady=12)
 
         # Settings gear button (right side, packed before URL so it's rightmost)
@@ -271,8 +384,9 @@ class App(tk.Tk):
             'Queue without starting  ·  Shift+Enter').pack(side='left', padx=2)
         tk.Button(url_wrap, text='Paste', command=self._paste_url,
                   **_bkw).pack(side='left', padx=2)
-        tk.Button(url_wrap, text='Fetch Info', command=self._fetch_info_btn,
-                  **_bkw).pack(side='left', padx=2)
+        self._fetch_btn = tk.Button(url_wrap, text='Fetch Info',
+                                    command=self._fetch_info_btn, **_bkw)
+        self._fetch_btn.pack(side='left', padx=2)
 
     def _refresh_ffmpeg_badge(self):
         if self._ffmpeg_path:
@@ -302,6 +416,14 @@ class App(tk.Tk):
             self.url_entry.insert(0, self._url_placeholder)
             self.url_entry.configure(fg=SUBT0)
             self._url_is_placeholder = True
+
+    def _url_text(self) -> str:
+        """The URL bar's real content: '' when it holds only the placeholder.
+        Also strips a placeholder that got left in front of pasted text."""
+        raw = self.url_var.get().strip()
+        if raw.startswith(self._url_placeholder):
+            raw = raw[len(self._url_placeholder):].strip()
+        return raw
 
     def _paste_url(self):
         try:
@@ -391,9 +513,7 @@ class App(tk.Tk):
         item = self.items.get(item_id)
         if not item:
             return
-        if not self._ffmpeg_path:
-            self._log('[ERR]  The clip editor needs FFmpeg. '
-                      'Set its path in Preferences → Tools.\n', 'red')
+        if self._raise_clip_editor(item_id) or not self._need_ffmpeg('clip editor'):
             return
 
         def resolve():
@@ -403,12 +523,7 @@ class App(tk.Tk):
                     'format': 'best[height<=480][acodec!=none][vcodec!=none]'
                               '/best[height<=720]/best'}
             s = self.settings
-            if s.get('proxy'):
-                opts['proxy'] = s['proxy']
-            if s.get('cookie_browser'):
-                opts['cookiesfrombrowser'] = (s['cookie_browser'],)
-            if s.get('cookie_file') and os.path.isfile(s['cookie_file']):
-                opts['cookiefile'] = s['cookie_file']
+            opts.update(network_opts(s, self._warn))
             try:
                 with YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(item.url, download=False)
@@ -419,19 +534,49 @@ class App(tk.Tk):
                     if not entries:
                         return ''
                     info = entries[0]
-                return info.get('url') or ''
+                # Some sites refuse a bare request, so the editor gets the
+                # headers yt-dlp would have sent along with the stream URL.
+                return (info.get('url') or '',
+                        info.get('http_headers') or None)
             except Exception as exc:
                 self.msg_q.put(('log', f'[ERR]  Clip preview: {exc}\n', 'red'))
                 return ''
 
         # Seed from this item's own range, not the sidebar's default.
         rng = item.clip_range
-        ClipEditor(
+        self._clip_editors[item_id] = ClipEditor(
             self, source=item.url, title=self._trunc(item.title, 60),
             ffmpeg=self._ffmpeg_path, resolver=resolve,
             initial_in=(rng[0] if rng else 0.0),
             initial_out=(rng[1] if rng and rng[1] != float('inf') else None),
             on_apply=lambda s, e, iid=item_id: self._set_item_clip(iid, s, e))
+
+    def _raise_clip_editor(self, key: str) -> bool:
+        """Bring an already-open editor for this item forward. True if there was one."""
+        editor = self._clip_editors.get(key)
+        try:
+            if editor is not None and editor.winfo_exists():
+                editor.lift()
+                editor.focus_force()
+                return True
+        except tk.TclError:
+            pass
+        self._clip_editors.pop(key, None)
+        return False
+
+    def _need_ffmpeg(self, what: str) -> bool:
+        """True when ffmpeg is available; otherwise say so and offer the fix."""
+        if self._ffmpeg_path:
+            return True
+        self._log(f'[ERR]  The {what} needs FFmpeg. '
+                  'Set its path in Preferences → Tools.\n', 'red')
+        self.status_var.set(f'The {what} needs FFmpeg.')
+        if messagebox.askyesno(
+                'FFmpeg not found',
+                f'The {what} needs FFmpeg, which was not found.\n\n'
+                'Open Preferences to set its path?', parent=self):
+            self._open_preferences()
+        return False
 
     @staticmethod
     def _clock(seconds: float) -> str:
@@ -444,22 +589,25 @@ class App(tk.Tk):
         item = self.conv_items.get(item_id)
         if not item:
             return
-        if not self._ffmpeg_path:
-            self._log('[ERR]  The clip editor needs FFmpeg. '
-                      'Set its path in Preferences → Tools.\n', 'red')
+        if self._raise_clip_editor(item_id) or not self._need_ffmpeg('clip editor'):
             return
         if not os.path.isfile(item.path):
             self._log(f'[ERR]  File is gone: {item.path}\n', 'red')
             return
 
         def apply_trim(start, end):
-            self.conv_trim_start_var.set('' if start is None else self._clock(start))
-            self.conv_trim_end_var.set('' if end is None else self._clock(end))
-            self._collect_conv_settings()
-            self._log('Trim range applied to the converter settings.\n', 'blue')
+            # Per file: the panel's own trim boxes stay the default for items
+            # that were not trimmed here.
+            item.trim = None if (start is None and end is None) else (start, end)
+            self._update_conv_card(item)
+            self._log(f'Trim for {self._trunc(item.filename, 40)}: '
+                      f'{item.trim_label or "cleared"}\n', 'blue')
 
-        ClipEditor(self, source=item.path, title=item.filename,
-                   ffmpeg=self._ffmpeg_path, on_apply=apply_trim)
+        trim = item.trim or (None, None)
+        self._clip_editors[item_id] = ClipEditor(
+            self, source=item.path, title=item.filename,
+            ffmpeg=self._ffmpeg_path, on_apply=apply_trim,
+            initial_in=(trim[0] or 0.0), initial_out=trim[1])
 
     def _open_preferences(self):
         """Open (or re-focus) the Preferences window."""
@@ -754,7 +902,7 @@ class App(tk.Tk):
                 'padx': 10, 'pady': 5, 'cursor': 'hand2', 'activeforeground': TEXT}
         tk.Button(df, text='⚙  Preferences…', command=self._open_preferences,
                   bg=SURF1, fg=TEXT, activebackground=SURF2, **_bkw).pack(side='left')
-        tk.Button(df, text='Save as Defaults', command=self._save_settings_now,
+        tk.Button(df, text='Save now', command=self._save_settings_now,
                   bg=SURF0, fg=TEXT, activebackground=SURF1, **_bkw
                   ).pack(side='left', padx=(6, 0))
         tk.Button(df, text='Reset', command=self._reset_settings,
@@ -768,8 +916,8 @@ class App(tk.Tk):
 
 
     # ─── Bottom bar ───────────────────────────────────────────────────────────
-    def _build_bottom(self):
-        bar = tk.Frame(self, bg=BASE)
+    def _build_bottom(self, parent, log_pane):
+        bar = tk.Frame(parent, bg=BASE)
         bar.pack(fill='x', padx=12, pady=6)
 
         _bkw = {'font': ('Segoe UI', 9), 'relief': 'flat', 'bd': 0,
@@ -803,8 +951,7 @@ class App(tk.Tk):
         # Packed/unpacked on demand in _update_total_progress()
 
         # Log strip
-        tk.Frame(self, bg=SURF1, height=1).pack(fill='x')
-        log_hdr = tk.Frame(self, bg=MANTLE)
+        log_hdr = tk.Frame(log_pane, bg=MANTLE)
         log_hdr.pack(fill='x')
         tk.Label(log_hdr, text='LOG', bg=MANTLE, fg=MAUVE,
                  font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(12, 0), pady=4)
@@ -812,13 +959,17 @@ class App(tk.Tk):
                   bg=MANTLE, fg=SUBT0, font=('Segoe UI', 8), relief='flat',
                   bd=0, padx=8, pady=2, cursor='hand2',
                   activebackground=SURF0).pack(side='right', padx=8, pady=2)
+        tk.Button(log_hdr, text='Copy', command=self._copy_log,
+                  bg=MANTLE, fg=SUBT0, font=('Segoe UI', 8), relief='flat',
+                  bd=0, padx=8, pady=2, cursor='hand2',
+                  activebackground=SURF0).pack(side='right', pady=2)
 
-        self.log_txt = tk.Text(self, height=5, bg=MANTLE, fg=SUBT0,
+        self.log_txt = tk.Text(log_pane, height=5, bg=MANTLE, fg=SUBT0,
                                font=('Consolas', 9), relief='flat', bd=0,
                                state='disabled', wrap='word',
                                insertbackground=TEXT,
                                selectbackground=SURF1, selectforeground=TEXT)
-        self.log_txt.pack(fill='x', padx=8, pady=(0, 6))
+        self.log_txt.pack(fill='both', expand=True, padx=8, pady=(0, 6))
         self.log_txt.tag_config('green',  foreground=GREEN)
         self.log_txt.tag_config('red',    foreground=RED)
         self.log_txt.tag_config('yellow', foreground=YELLOW)
@@ -988,18 +1139,22 @@ class App(tk.Tk):
         Returns the new item ids so callers (the clipboard watcher, the info
         popup) can act on them.
         """
-        if self._url_is_placeholder:
-            return []
-        raw = self.url_var.get().strip()
+        raw = self._url_text()
         if not raw:
             return []
         urls = self._split_urls(raw)
         if not urls:
             return []
         self.url_entry.delete(0, 'end')
-        self.url_entry.insert(0, self._url_placeholder)
-        self.url_entry.configure(fg=SUBT0)
-        self._url_is_placeholder = True
+        # Focus normally stays in the box after Enter. Writing the placeholder
+        # back then would leave it there for good (FocusIn never fires again),
+        # so the next paste landed after it.
+        if self.focus_get() is self.url_entry:
+            self.url_entry.configure(fg=TEXT)
+            self._url_is_placeholder = False
+        else:
+            self._url_is_placeholder = False
+            self._url_focus_out(None)
         ids = self._queue_urls(urls)
         self._log(f'Added {len(ids)} URL(s) to queue.\n', 'blue')
         if start:
@@ -1037,12 +1192,7 @@ class App(tk.Tk):
                 # Nobody asked for this lookup, so its failures stay silent
                 # instead of being written to stderr.
                 'logger': NullLogger()}
-        if s.get('proxy'):
-            opts['proxy'] = s['proxy']
-        if s.get('cookie_browser'):
-            opts['cookiesfrombrowser'] = (s['cookie_browser'],)
-        if s.get('cookie_file') and os.path.isfile(s['cookie_file']):
-            opts['cookiefile'] = s['cookie_file']
+        opts.update(network_opts(s))
         iid, url = item.id, item.url
 
         def worker():
@@ -1069,12 +1219,13 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _fetch_info_btn(self):
-        if self._url_is_placeholder:
+        if self._fetching:
             return
-        raw = self.url_var.get().strip()
+        raw = self._url_text()
         if not raw:
             return
-        url = self._split_urls(raw)[0] if self._split_urls(raw) else raw
+        urls = self._split_urls(raw)
+        url = urls[0] if urls else raw
         s = self._collect_settings()
 
         # Reuse the download credentials/network settings. Without these, info
@@ -1086,16 +1237,13 @@ class App(tk.Tk):
         opts: dict = {'quiet': True, 'no_warnings': True, 'skip_download': True,
                       'noplaylist': s['no_playlist'],
                       'extract_flat': 'in_playlist'}
-        if s['proxy']:
-            opts['proxy'] = s['proxy']
-        if s['cookie_browser']:
-            opts['cookiesfrombrowser'] = (s['cookie_browser'],)
-        if s['cookie_file'] and os.path.isfile(s['cookie_file']):
-            opts['cookiefile'] = s['cookie_file']
+        opts.update(network_opts(s, self._warn))
         if self._ffmpeg_path:
             opts['ffmpeg_location'] = os.path.dirname(self._ffmpeg_path)
 
         self.status_var.set('Fetching info…')
+        self._fetching = True
+        self._fetch_btn.configure(state='disabled')
         threading.Thread(target=self._fetch_info_thread, args=(url, opts),
                          daemon=True).start()
 
@@ -1127,6 +1275,8 @@ class App(tk.Tk):
         except Exception as exc:
             self.msg_q.put(('status', f'Fetch error: {exc}'))
             self.msg_q.put(('log', f'[ERR]  Fetch failed: {exc}\n', 'red'))
+        finally:
+            self.msg_q.put(('fetch_done',))
 
     # ─── Queue card management ────────────────────────────────────────────────
     _CARD_BG   = SURF0
@@ -1135,7 +1285,7 @@ class App(tk.Tk):
     _CANCEL_BG = '#26262e'
 
     def _add_card(self, item: DownloadItem):
-        if self._empty_lbl.winfo_ismapped():
+        if self._empty_lbl.winfo_manager():
             self._empty_lbl.pack_forget()
 
         card = tk.Frame(self._q_frame, bg=self._CARD_BG, padx=10, pady=8)
@@ -1196,6 +1346,15 @@ class App(tk.Tk):
         clip_btn.pack(side='right', padx=(0, 4))
         self._tooltip(clip_btn, 'Set in/out points visually (or double-click the card)')
 
+        # Pause is cancel + resume: yt-dlp continues from the .part file.
+        # Packed only while a download is actually running.
+        pause_btn = tk.Button(bot, text='⏸', bg=self._CARD_BG, fg=SUBT0,
+                              font=('Segoe UI', 9), relief='flat', bd=0,
+                              padx=6, pady=2, cursor='hand2',
+                              activebackground=SURF1, activeforeground=TEXT,
+                              command=lambda iid=item.id: self._pause_item(iid))
+        self._tooltip(pause_btn, 'Pause — Resume continues from where it stopped')
+
         # Secondary line: partial-playlist summary, or the error hint.
         note_lbl = tk.Label(card, text='', bg=self._CARD_BG, fg=YELLOW,
                             font=('Segoe UI', 8), anchor='w', justify='left',
@@ -1203,7 +1362,7 @@ class App(tk.Tk):
 
         wdg = {
             'card': card, 'check_var': check_var, 'clip_btn': clip_btn,
-            'title_lbl': title_lbl, 'status_lbl': status_lbl,
+            'pause_btn': pause_btn, 'title_lbl': title_lbl, 'status_lbl': status_lbl,
             'clip_lbl': clip_lbl, 'note_lbl': note_lbl,
             'prog': prog, 'info_lbl': info_lbl,
             'action_btn': action_btn,
@@ -1223,6 +1382,29 @@ class App(tk.Tk):
         self._update_card(item)
 
     # ── Card context menu ────────────────────────────────────────────────────
+    def _popup_menu(self, attr: str, event, entries: list):
+        """Show a right-click menu built from (label, command, enabled) tuples
+        (None = separator). One Menu per kind is kept and repopulated —
+        building a fresh one on every click leaked a widget each time."""
+        menu = getattr(self, attr, None)
+        if menu is None:
+            menu = tk.Menu(self, tearoff=0, bg=SURF0, fg=TEXT,
+                           activebackground=MAUVE, activeforeground=CRUST,
+                           bd=0, font=('Segoe UI', 9))
+            setattr(self, attr, menu)
+        menu.delete(0, 'end')
+        for entry_ in entries:
+            if entry_ is None:
+                menu.add_separator()
+            else:
+                label, cmd, enabled = entry_
+                menu.add_command(label=label, command=cmd,
+                                 state='normal' if enabled else 'disabled')
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def _post_card_menu(self, event, item_id: str):
         """Right-click menu — the single route to every per-item action.
 
@@ -1233,35 +1415,64 @@ class App(tk.Tk):
         if not item:
             return
         has_file = bool(item.paths and os.path.exists(item.paths[0]))
-        menu = tk.Menu(self, tearoff=0, bg=SURF0, fg=TEXT,
-                       activebackground=MAUVE, activeforeground=CRUST,
-                       bd=0, font=('Segoe UI', 9))
+        order = list(self.items)
+        pos = order.index(item_id)
+        self._popup_menu('_card_menu', event, [
+            ('Open file', lambda: self._reveal(item.paths[0]), has_file),
+            ('Show in folder', lambda: self._show_in_folder(item.paths[0]), has_file),
+            ('Send to Converter', lambda: self._send_to_converter(item), has_file),
+            None,
+            ('Copy URL', lambda: self._copy(item.url), True),
+            ('Edit clip range…', lambda: self._open_clip_editor(item_id), True),
+            ('Clear clip range',
+             lambda: self._set_item_clip(item_id, None, None), bool(item.clip_range)),
+            ('Duplicate', lambda: self._duplicate_item(item), True),
+            None,
+            ('Move to top', lambda: self._move_item(item_id, 'top'), pos > 0),
+            ('Move up', lambda: self._move_item(item_id, 'up'), pos > 0),
+            ('Move down', lambda: self._move_item(item_id, 'down'),
+             pos < len(order) - 1),
+            None,
+            ('Pause', lambda: self._pause_item(item_id),
+             item.status == DownloadItem.DOWNLOADING),
+            ('Resume' if item.paused else 'Retry',
+             lambda: self._retry_item(item_id), item.status not in DownloadItem.ACTIVE),
+            ('Remove', lambda: self._remove_one(item_id), True),
+        ])
 
-        menu.add_command(label='Open file', state='normal' if has_file else 'disabled',
-                         command=lambda: self._reveal(item.paths[0]))
-        menu.add_command(label='Show in folder',
-                         state='normal' if has_file else 'disabled',
-                         command=lambda: self._reveal(os.path.dirname(item.paths[0])))
-        menu.add_command(label='Send to Converter',
-                         state='normal' if has_file else 'disabled',
-                         command=lambda: self._send_to_converter(item))
-        menu.add_separator()
-        menu.add_command(label='Copy URL', command=lambda: self._copy(item.url))
-        menu.add_command(label='Edit clip range…',
-                         command=lambda: self._open_clip_editor(item_id))
-        menu.add_command(label='Clear clip range',
-                         state='normal' if item.clip_range else 'disabled',
-                         command=lambda: self._set_item_clip(item_id, None, None))
-        menu.add_command(label='Duplicate', command=lambda: self._duplicate_item(item))
-        menu.add_separator()
-        menu.add_command(label='Retry',
-                         state='disabled' if item.status in DownloadItem.ACTIVE else 'normal',
-                         command=lambda: self._retry_item(item_id))
-        menu.add_command(label='Remove', command=lambda: self._remove_one(item_id))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+    def _move_item(self, item_id: str, where: str):
+        """Reorder a queue card. The dict order is the visible order, and it is
+        what Download All / Download Selected start items in."""
+        order = list(self.items)
+        if item_id not in order:
+            return
+        i = order.index(item_id)
+        order.remove(item_id)
+        j = {'top': 0, 'up': max(i - 1, 0), 'down': min(i + 1, len(order))}[where]
+        order.insert(j, item_id)
+        # Swap the dict objects rather than mutating them: the title-lookup
+        # threads read self.items, and a half-rebuilt dict would look empty.
+        self.items = {k: self.items[k] for k in order}
+        self._q_widgets = {k: self._q_widgets[k] for k in order if k in self._q_widgets}
+        prev = None
+        for k in order:                       # repack in the new order
+            wdg = self._q_widgets.get(k)
+            if wdg:
+                if prev is None:
+                    first = next(iter(self._q_frame.pack_slaves()), None)
+                    if first is not wdg['card']:
+                        wdg['card'].pack(fill='x', padx=4, pady=3, before=first)
+                else:
+                    wdg['card'].pack(fill='x', padx=4, pady=3, after=prev)
+                prev = wdg['card']
+        self._q_sync_scroll()
+
+    def _pause_item(self, item_id: str):
+        item = self.items.get(item_id)
+        if not item or item.status != DownloadItem.DOWNLOADING:
+            return
+        self._cancel_item(item_id)
+        item.paused = True      # after the cancel, which clears it
 
     def _copy(self, text: str):
         self.clipboard_clear()
@@ -1272,6 +1483,17 @@ class App(tk.Tk):
     def _remove_one(self, item_id: str):
         self._remove_card(item_id)
         self.items.pop(item_id, None)
+
+    @staticmethod
+    def _show_in_folder(path: str):
+        """Open the folder with the file highlighted (Explorer), else just the folder."""
+        try:
+            if sys.platform == 'win32' and os.path.exists(path):
+                subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
+                return
+        except Exception:
+            pass
+        App._reveal(os.path.dirname(path) or path)
 
     def _duplicate_item(self, item: DownloadItem):
         """Queue the same URL again as a fresh PENDING item.
@@ -1285,6 +1507,7 @@ class App(tk.Tk):
         copy.format_override = item.format_override
         copy.duration = item.duration
         copy.uploader = item.uploader
+        copy.title_locked = item.title_locked
         self.items[copy.id] = copy
         self._add_card(copy)
         self._log(f'Duplicated {self._trunc(item.title, 40)}.\n', 'blue')
@@ -1340,9 +1563,9 @@ class App(tk.Tk):
         label = item.clip_label
         if label:
             wdg['clip_lbl'].configure(text=f'✂ {label}  ')
-            if not wdg['clip_lbl'].winfo_ismapped():
-                wdg['clip_lbl'].pack(side='right', before=wdg['status_lbl'])
-        elif wdg['clip_lbl'].winfo_ismapped():
+            if not wdg['clip_lbl'].winfo_manager():
+                wdg['clip_lbl'].pack(side='right', after=wdg['status_lbl'])
+        elif wdg['clip_lbl'].winfo_manager():
             wdg['clip_lbl'].pack_forget()
 
         # Secondary note (partial playlist, error hint).
@@ -1352,9 +1575,9 @@ class App(tk.Tk):
         if note:
             wdg['note_lbl'].configure(
                 text=note, fg=RED if item.status == DownloadItem.ERROR else YELLOW)
-            if not wdg['note_lbl'].winfo_ismapped():
+            if not wdg['note_lbl'].winfo_manager():
                 wdg['note_lbl'].pack(fill='x', after=wdg['prog'])
-        elif wdg['note_lbl'].winfo_ismapped():
+        elif wdg['note_lbl'].winfo_manager():
             wdg['note_lbl'].pack_forget()
 
         STATUS_COLORS = {
@@ -1368,6 +1591,8 @@ class App(tk.Tk):
             DownloadItem.CANCELLED:   (SUBT0,  'CANCELLED'),
         }
         col, label = STATUS_COLORS.get(item.status, (SUBT0, item.status.upper()))
+        if item.paused and item.status == DownloadItem.CANCELLED:
+            col, label = BLUE, 'PAUSED'
         wdg['status_lbl'].configure(text=label, fg=col)
 
         # Info / error text. Only surface the error on a card that actually
@@ -1391,8 +1616,27 @@ class App(tk.Tk):
                                  f'ETA {item.eta}' if item.eta else ''] if p]
             wdg['info_lbl'].configure(text='   '.join(parts), fg=SUBT0, wraplength=0)
 
+        # Pause only makes sense while bytes are actually coming down.
+        if item.status == DownloadItem.DOWNLOADING:
+            if not wdg['pause_btn'].winfo_manager():
+                wdg['pause_btn'].pack(side='right', padx=(0, 4),
+                                      after=wdg['action_btn'])
+        elif wdg['pause_btn'].winfo_manager():
+            wdg['pause_btn'].pack_forget()
+
         # Tint + action button
-        if item.status == DownloadItem.DONE:
+        if item.status == DownloadItem.PENDING:
+            # Also the state after Retry/Resume's reset: back to a neutral card.
+            if wdg['card_bg'] != self._CARD_BG:
+                self._tint(wdg, self._CARD_BG)
+                wdg['prog'].configure(style='Horizontal.TProgressbar')
+            wdg['action_btn'].configure(
+                text='Start', state='normal',
+                bg=self._CARD_BG, fg=GREEN,
+                activebackground=SURF1,
+                command=lambda iid=item.id: self._start_downloads([iid]))
+
+        elif item.status == DownloadItem.DONE:
             self._tint(wdg, self._DONE_BG)
             wdg['prog'].configure(style='Green.Horizontal.TProgressbar')
             # "Done" was a dead end: the file was on disk and the app offered
@@ -1414,7 +1658,7 @@ class App(tk.Tk):
         elif item.status == DownloadItem.CANCELLED:
             self._tint(wdg, self._CANCEL_BG)
             wdg['action_btn'].configure(
-                text='↺ Retry', state='normal',
+                text='▶ Resume' if item.paused else '↺ Retry', state='normal',
                 bg=SURF1, fg=TEXT,
                 activebackground=SURF2,
                 command=lambda iid=item.id: self._retry_item(iid))
@@ -1484,22 +1728,27 @@ class App(tk.Tk):
         return f'{h}:{m:02d}:{s:02d}' if h else f'{m}:{s:02d}'
 
     @staticmethod
-    def _tint_widgets(card: tk.Widget, color: str):
-        """Paint a card frame and its non-ttk descendants with a background colour."""
-        for widget in [card] + card.winfo_children():
+    def _tint_widgets(card: tk.Widget, color: str, skip=()):
+        """Paint a card frame and its non-ttk descendants with a background
+        colour. `skip` lists widgets with a colour of their own (badges)."""
+        def paint(widget):
+            if widget in skip:
+                return
             try:
                 widget.configure(bg=color)
+                if widget.winfo_class() == 'Checkbutton':
+                    widget.configure(activebackground=color)
             except Exception:
                 pass
+
+        for widget in [card] + card.winfo_children():
+            paint(widget)
             for child in widget.winfo_children():
-                try:
-                    child.configure(bg=color)
-                except Exception:
-                    pass
+                paint(child)
 
     def _tint(self, wdg: dict, color: str):
         wdg['card_bg'] = color
-        self._tint_widgets(wdg['card'], color)
+        self._tint_widgets(wdg['card'], color, skip=(wdg.get('ext_badge'),))
 
     # ─── Queue operations ─────────────────────────────────────────────────────
     def _select_all(self):
@@ -1528,15 +1777,23 @@ class App(tk.Tk):
             self._log('Nothing to retry.\n', 'yellow')
             return
         for iid in failed:
-            self._retry_item(iid)
+            self._reset_item(iid)
+        self._start_downloads(failed)
 
     def _remove_selected(self):
         inactive = {DownloadItem.PENDING, DownloadItem.DONE,
                     DownloadItem.ERROR, DownloadItem.CANCELLED}
-        for iid in [i for i, w in self._q_widgets.items()
-                    if w['check_var'].get()
-                    and self.items.get(i)
-                    and self.items[i].status in inactive]:
+        doomed = [i for i, w in self._q_widgets.items()
+                  if w['check_var'].get()
+                  and self.items.get(i)
+                  and self.items[i].status in inactive]
+        # Every card starts ticked, so Delete with nothing in mind could take
+        # out the whole queue in one keystroke.
+        if len(doomed) > 3 and not messagebox.askyesno(
+                'Remove items', f'Remove {len(doomed)} items from the queue?',
+                parent=self):
+            return
+        for iid in doomed:
             self._remove_card(iid)
             self.items.pop(iid, None)
 
@@ -1550,33 +1807,33 @@ class App(tk.Tk):
 
     def _cancel_item(self, item_id: str):
         item = self.items.get(item_id)
-        if not item:
+        # A PENDING item has no worker; setting its cancel flag would only
+        # poison it, so the next Start would cancel itself immediately.
+        if not item or item.status not in DownloadItem.ACTIVE:
             return
+        item.paused = False
         item.cancel()
         wdg = self._q_widgets.get(item_id)
         if wdg:
             wdg['action_btn'].configure(text='Cancelling…', state='disabled')
 
-    def _retry_item(self, item_id: str):
+    def _reset_item(self, item_id: str) -> bool:
+        """Put an item back to PENDING (the card repaints itself)."""
         item = self.items.get(item_id)
         if not item:
-            return
+            return False
         item.reset()
         wdg = self._q_widgets.get(item_id)
         if wdg:
-            # Restore neutral card appearance
-            self._tint(wdg, self._CARD_BG)
             wdg['prog']['value'] = 0
-            wdg['prog'].configure(style='Horizontal.TProgressbar')
             wdg['info_lbl'].configure(text='', fg=SUBT0, wraplength=0)
-            wdg['action_btn'].configure(
-                text='Cancel', state='normal',
-                bg=self._CARD_BG, fg=SUBT0,
-                activebackground=SURF1,
-                command=lambda iid=item_id: self._cancel_item(iid))
-            wdg['status_lbl'].configure(text='PENDING', fg=YELLOW)
+        self._update_card(item)
         self._last_logged_pct.pop(item_id, None)
-        self._start_downloads([item_id])
+        return True
+
+    def _retry_item(self, item_id: str):
+        if self._reset_item(item_id):
+            self._start_downloads([item_id])
 
     @staticmethod
     def _reveal(path: str):
@@ -1596,6 +1853,15 @@ class App(tk.Tk):
             self._reveal(path)
         else:
             self._log(f'Output folder does not exist: {path}\n', 'yellow')
+
+    def _copy_log(self):
+        """Copy the selection if there is one, else the whole log."""
+        try:
+            text = self.log_txt.get('sel.first', 'sel.last')
+        except tk.TclError:
+            text = self.log_txt.get('1.0', 'end-1c')
+        self._copy(text)
+        self.status_var.set('Log copied.')
 
     def _clear_log(self):
         self.log_txt.configure(state='normal')
@@ -1655,6 +1921,16 @@ class App(tk.Tk):
         ('cookie_file_var',     'cookie_file'),
         ('post_conv_var',       'post_convert_preset'),
         ('watch_clip_var',      'watch_clipboard'),
+        ('sleep_int_var',       'sleep_interval'),
+        ('sleep_max_var',       'max_sleep_interval'),
+        ('sleep_req_var',       'sleep_interval_requests'),
+        ('playlist_items_var',  'playlist_items'),
+        ('socket_timeout_var',  'socket_timeout'),
+        ('force_ipv4_var',      'force_ipv4'),
+        ('extractor_retries_var', 'extractor_retries'),
+        ('trim_name_var',       'trim_file_name'),
+        ('break_existing_var',  'break_on_existing'),
+        ('thumb_jpg_var',       'thumbnail_to_jpg'),
     ]
 
     def _create_setting_vars(self):
@@ -1677,6 +1953,7 @@ class App(tk.Tk):
     def _setting_var_map(self) -> list:
         """(settings_key, tk_var) for every download-tab setting."""
         return [(key, getattr(self, attr)) for attr, key in self._SETTING_VARS]
+
     def _collect_settings(self) -> dict:
         for key, var in self._setting_var_map():
             self.settings[key] = var.get()
@@ -1696,7 +1973,7 @@ class App(tk.Tk):
         return build_format_opts(item, s, self._warn)
 
     def _build_postprocessors(self, s):
-        return build_postprocessors(s)
+        return build_postprocessors(s, self._warn)
 
     def _build_ydl_opts(self, item, s: dict) -> dict:
         return build_ydl_opts(
@@ -1720,6 +1997,11 @@ class App(tk.Tk):
         iid = item.id
 
         def hook(filepath):
+            # Recorded here, on the worker thread, not when the message is
+            # drained: the worker checks item.paths the moment download()
+            # returns, which can be before the main loop has seen the message.
+            if filepath and filepath not in item.paths:
+                item.paths.append(filepath)
             self.msg_q.put(('file', iid, filepath))
         return hook
 
@@ -1764,6 +2046,7 @@ class App(tk.Tk):
         s['conv_trim_start'] = s['conv_trim_end'] = ''
         s['conv_overwrite'] = True
         conv = ConvItem(path)
+        conv.retry_settings = s
         self.conv_items[conv.id] = conv
         self._add_conv_card(conv)
         self._log(f'Converting {self._trunc(os.path.basename(path), 40)} '
@@ -1887,6 +2170,10 @@ class App(tk.Tk):
                 slot.release()
             item.speed = ''
             item.eta   = ''
+            # Only drop our own entry — a Retry may already have registered
+            # its replacement thread under the same id.
+            if self._threads.get(item.id) is threading.current_thread():
+                self._threads.pop(item.id, None)
             self.msg_q.put(('update', item))
             tag = {DownloadItem.DONE: 'green',
                    DownloadItem.CANCELLED: 'yellow'}.get(item.status, 'red')
@@ -1914,6 +2201,8 @@ class App(tk.Tk):
             # Claim the item on the main thread *before* spawning. The worker
             # used to set this itself, so two quick clicks on "Download" both
             # passed the check and ran the same URL twice.
+            if item.is_cancelled:
+                item._cancel = threading.Event()
             item.status = DownloadItem.QUEUED
             item.error  = ''
             item.note   = ''
@@ -1922,7 +2211,14 @@ class App(tk.Tk):
             preset = self.post_conv_var.get()
             item.post_convert = preset if preset in CONV_PRESETS else ''
             self._update_card(item)
-            opts = self._build_ydl_opts(item, s)
+            try:
+                opts = self._build_ydl_opts(item, s)
+            except Exception as exc:
+                # Without this the item sat at QUEUED forever with no worker.
+                item.status = DownloadItem.ERROR
+                item.error = f'Could not prepare the download: {exc}'
+                self._update_card(item)
+                continue
             t = threading.Thread(target=self._download_worker,
                                  args=(item, opts, slot), daemon=True)
             self._threads[iid] = t
@@ -1966,7 +2262,30 @@ class App(tk.Tk):
                     self._log(f'[GUI] {type(exc).__name__}: {exc}\n', 'red')
         finally:
             if not self._closing:
+                try:
+                    self._check_idle()
+                except Exception:
+                    pass
                 self._poll_after_id = self.after(80, self._poll)
+
+    def _check_idle(self):
+        """Nudge the user when the queue empties while they are elsewhere."""
+        busy = (any(i.status in DownloadItem.ACTIVE for i in self.items.values())
+                or any(c.status in (ConvItem.QUEUED, ConvItem.RUNNING)
+                       for c in self.conv_items.values()))
+        if self._was_busy and not busy and self.focus_displayof() is None:
+            try:
+                self.bell()
+            except tk.TclError:
+                pass
+            if sys.platform == 'win32':
+                try:
+                    import ctypes
+                    user32 = ctypes.windll.user32
+                    user32.FlashWindow(user32.GetParent(self.winfo_id()), True)
+                except Exception:
+                    pass
+        self._was_busy = busy
 
     def _handle(self, msg):
         kind = msg[0]
@@ -1981,6 +2300,11 @@ class App(tk.Tk):
                 return
             status = d.get('status')
 
+            # A late progress message for an item that already finished,
+            # failed or was cancelled must not drag it back to life.
+            if status in ('downloading', 'error') and item.status not in DownloadItem.ACTIVE:
+                return
+
             if status == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
                 dl    = d.get('downloaded_bytes') or 0
@@ -1992,10 +2316,10 @@ class App(tk.Tk):
                 item.size_str = (f'{format_bytes(dl)}/{format_bytes(total)}'
                                  if total else format_bytes(dl)) if dl else ''
                 self._note_playlist(item, d)
-                if d.get('title') and not item.entry_count:
+                if (d.get('title') and not item.entry_count
+                        and not item.title_locked):
                     item.title = d['title']
-                if item.status != DownloadItem.CANCELLED:
-                    item.status = DownloadItem.DOWNLOADING
+                item.status = DownloadItem.DOWNLOADING
                 self._update_card(item)
                 # Progress hooks fire many times a second; logging every one
                 # flooded the strip and made the whole app stutter.
@@ -2049,8 +2373,8 @@ class App(tk.Tk):
             # split reports several.
             _, iid, path = msg
             item = self.items.get(iid)
-            if item and path and path not in item.paths:
-                item.paths.append(path)
+            if item and path and path not in item._chained:
+                item._chained.add(path)
                 self._chain_convert(item, path)
 
         elif kind == 'meta':
@@ -2058,7 +2382,7 @@ class App(tk.Tk):
             _, iid, info = msg
             item = self.items.get(iid)
             if item:
-                if info.get('title'):
+                if info.get('title') and not item.title_locked:
                     item.title = info['title']
                 item.duration       = info.get('duration') or 0.0
                 item.uploader       = info.get('uploader') or ''
@@ -2091,6 +2415,10 @@ class App(tk.Tk):
         elif kind == 'conv_update':
             self._update_conv_card(msg[1])
 
+        elif kind == 'fetch_done':
+            self._fetching = False
+            self._fetch_btn.configure(state='normal')
+
         elif kind == 'update_result':
             cb = self._pending_update_callback
             if cb:
@@ -2103,12 +2431,17 @@ class App(tk.Tk):
     _LOG_MAX_LINES = 500
 
     def _log(self, text: str, tag: str = ''):
+        # Follow the output only if the reader is already at the bottom;
+        # otherwise a busy download yanks the view away from what they scrolled
+        # back to read.
+        at_end = self.log_txt.yview()[1] > 0.999
         self.log_txt.configure(state='normal')
         if tag:
             self.log_txt.insert('end', text, tag)
         else:
             self.log_txt.insert('end', text)
-        self.log_txt.see('end')
+        if at_end:
+            self.log_txt.see('end')
         # Only check line count when a newline was actually inserted.
         if '\n' in text:
             lines = int(self.log_txt.index('end-1c').split('.', 1)[0])
@@ -2124,6 +2457,7 @@ class App(tk.Tk):
         popup.configure(bg=BASE)
         popup.transient(self)
         popup.grab_set()
+        popup.bind('<Escape>', lambda _e: popup.destroy())
         self._apply_dark_titlebar(popup)
 
         title = info.get('title', 'Unknown')
@@ -2165,6 +2499,8 @@ class App(tk.Tk):
 
         # Sort handler: numeric columns sort numerically, text columns lexically.
         # Resolution like "1920×1080" sorts by the leading int.
+        size_raw: dict[str, int] = {}     # row iid -> bytes, for a numeric Size sort
+
         def sort_by(col, descending):
             def keyfn(s):
                 if not s:
@@ -2175,9 +2511,13 @@ class App(tk.Tk):
                     return (1, float(t))
                 except ValueError:
                     return (2, s)
-            rows = [(tree.set(k, col), k) for k in tree.get_children('')]
-            rows.sort(key=lambda p: keyfn(p[0]), reverse=descending)
-            for idx, (_v, k) in enumerate(rows):
+
+            def row_key(k):
+                if col == 'Size':       # "1.5MiB" text sorts wrongly
+                    return (1, float(size_raw[k])) if size_raw.get(k) else (0, '')
+                return keyfn(tree.set(k, col))
+            rows = sorted(tree.get_children(''), key=row_key, reverse=descending)
+            for idx, k in enumerate(rows):
                 tree.move(k, '', idx)
             tree.heading(col, command=lambda c=col: sort_by(c, not descending))
 
@@ -2209,6 +2549,7 @@ class App(tk.Tk):
                                       f'{tbr:.0f}k' if tbr else '',
                                       format_bytes(fs) if fs else ''))
             row_kind[iid] = tag
+            size_raw[iid] = int(fs) if fs else 0
 
         tsb = ttk.Scrollbar(tf, orient='vertical', command=tree.yview)
         tree.configure(yscrollcommand=tsb.set)
@@ -2245,6 +2586,7 @@ class App(tk.Tk):
             new = DownloadItem(url_final,
                                clip_range=self._parse_clip_range(self.settings))
             new.title = title
+            new.title_locked = True
             new.duration = info.get('duration') or 0.0
             new.uploader = info.get('uploader') or ''
             new.format_override = selector
@@ -2301,9 +2643,10 @@ class App(tk.Tk):
         # Make it obvious that selecting a row changes what "Add" will queue.
         tree.bind('<<TreeviewSelect>>', lambda _e: add_btn.configure(
             text='Queue Selected Format' if tree.selection() else 'Add to Queue'))
+        tree.bind('<Double-1>', lambda e: download_selected_format()
+                  if tree.identify_region(e.x, e.y) == 'cell' else None)
         tk.Button(btn_row, text='Copy URL',
-                  command=lambda: (self.clipboard_clear(),
-                                   self.clipboard_append(url_final)),
+                  command=lambda: self._copy(url_final),
                   bg=SURF0, fg=TEXT, activebackground=SURF1,
                   **_bkw).pack(side='left', padx=(6, 0))
         tk.Button(btn_row, text='Close', command=popup.destroy,
@@ -2366,6 +2709,7 @@ class App(tk.Tk):
                 item = DownloadItem(
                     url, clip_range=(start, end if end is not None else float('inf')))
                 item.title = f'{title} — {name}'
+                item.title_locked = True
                 self.items[item.id] = item
                 self._add_card(item)
                 added += 1
@@ -2395,6 +2739,7 @@ class App(tk.Tk):
         popup.configure(bg=BASE)
         popup.transient(self)
         popup.grab_set()
+        popup.bind('<Escape>', lambda _e: popup.destroy())
         self._apply_dark_titlebar(popup)
 
         tk.Label(popup, text=data.get('title') or 'Playlist', bg=BASE, fg=TEXT,
@@ -2814,7 +3159,7 @@ class App(tk.Tk):
     _CONV_ERROR_BG = '#2f1c1c'
 
     def _add_conv_card(self, item: ConvItem):
-        if self._conv_empty_lbl and self._conv_empty_lbl.winfo_ismapped():
+        if self._conv_empty_lbl and self._conv_empty_lbl.winfo_manager():
             self._conv_empty_lbl.pack_forget()
 
         card = tk.Frame(self._conv_frame, bg=self._CONV_CARD_BG, padx=10, pady=8)
@@ -2853,12 +3198,12 @@ class App(tk.Tk):
                             wraplength=0)
         info_lbl.pack(side='left', fill='x', expand=True)
 
-        action_btn = tk.Button(bot, text='Cancel',
+        # Label and command are set per status by _update_conv_card.
+        action_btn = tk.Button(bot, text='Remove',
                                bg=self._CONV_CARD_BG, fg=SUBT0,
                                font=('Segoe UI', 8), relief='flat', bd=0,
                                padx=6, pady=2, cursor='hand2',
-                               activebackground=SURF1, activeforeground=TEXT,
-                               command=lambda: self.conv_items.get(item.id) and self.conv_items[item.id].cancel())
+                               activebackground=SURF1, activeforeground=TEXT)
         action_btn.pack(side='right')
 
         clip_btn = tk.Button(bot, text='✂', bg=self._CONV_CARD_BG, fg=SUBT0,
@@ -2869,8 +3214,14 @@ class App(tk.Tk):
         clip_btn.pack(side='right', padx=(0, 4))
         self._tooltip(clip_btn, 'Pick trim points visually (or double-click the card)')
 
+        # Per-file trim badge; packed only when this file has its own range.
+        trim_lbl = tk.Label(top, text='', bg=self._CONV_CARD_BG, fg=MAUVE,
+                            font=('Segoe UI', 8, 'bold'))
+        self._tooltip(trim_lbl, 'This file is trimmed to a range of its own')
+
         wdg = {
             'card': card, 'chk_var': chk_var, 'clip_btn': clip_btn,
+            'trim_lbl': trim_lbl,
             'name_lbl': name_lbl, 'ext_badge': ext_badge,
             'status_lbl': status_lbl, 'prog': prog,
             'info_lbl': info_lbl, 'action_btn': action_btn,
@@ -2881,6 +3232,44 @@ class App(tk.Tk):
         for w in (card, top, bot, name_lbl, info_lbl):
             w.bind('<Double-Button-1>',
                    lambda _e, iid=item.id: self._open_conv_clip_editor(iid))
+            w.bind('<Button-3>',
+                   lambda e, iid=item.id: self._post_conv_menu(e, iid))
+        self._update_conv_card(item)
+
+    def _post_conv_menu(self, event, item_id: str):
+        """Right-click menu for a converter card — without it a failed
+        conversion was a dead end."""
+        item = self.conv_items.get(item_id)
+        if not item:
+            return
+        has_out = bool(item.status == ConvItem.DONE and item.out_path
+                       and os.path.exists(item.out_path))
+        idle = item.status not in (ConvItem.QUEUED, ConvItem.RUNNING)
+        self._popup_menu('_conv_menu', event, [
+            ('Open output', lambda: self._reveal(item.out_path), has_out),
+            ('Show in folder', lambda: self._show_in_folder(item.out_path), has_out),
+            None,
+            ('Edit trim…', lambda: self._open_conv_clip_editor(item_id), True),
+            ('Clear trim', lambda: self._set_conv_trim(item, None, None),
+             bool(item.trim)),
+            None,
+            ('Retry', lambda: self._retry_conv(item_id),
+             item.status in (ConvItem.ERROR, ConvItem.CANCELLED, ConvItem.DONE)),
+            ('Remove', lambda: self._remove_conv_card(item_id), True),
+        ])
+
+    def _set_conv_trim(self, item: ConvItem, start, end):
+        item.trim = None if (start is None and end is None) else (start, end)
+        self._update_conv_card(item)
+
+    def _retry_conv(self, item_id: str):
+        item = self.conv_items.get(item_id)
+        if not item or item.status in (ConvItem.QUEUED, ConvItem.RUNNING):
+            return
+        item.reset()
+        self._update_conv_card(item)
+        s = item.retry_settings or self._collect_conv_settings()
+        self._start_conversion_items([item], s)
 
     def _update_conv_card(self, item: ConvItem):
         wdg = self._conv_widgets.get(item.id)
@@ -2891,6 +3280,7 @@ class App(tk.Tk):
 
         STATUS = {
             ConvItem.PENDING:   (YELLOW, 'PENDING'),
+            ConvItem.QUEUED:    (BLUE,   'QUEUED'),
             ConvItem.RUNNING:   (MAUVE,  'RUNNING'),
             ConvItem.DONE:      (GREEN,  'DONE'),
             ConvItem.ERROR:     (RED,    'ERROR'),
@@ -2899,13 +3289,40 @@ class App(tk.Tk):
         col, label = STATUS.get(item.status, (SUBT0, item.status.upper()))
         wdg['status_lbl'].configure(text=label, fg=col)
 
+        if item.trim_label:
+            wdg['trim_lbl'].configure(text=f'✂ {item.trim_label}  ')
+            if not wdg['trim_lbl'].winfo_manager():
+                wdg['trim_lbl'].pack(side='right', after=wdg['status_lbl'])
+        elif wdg['trim_lbl'].winfo_manager():
+            wdg['trim_lbl'].pack_forget()
+
         if item.error:
             wdg['info_lbl'].configure(text=item.error, fg=RED, wraplength=340)
+        elif item.status == ConvItem.QUEUED:
+            wdg['info_lbl'].configure(text='Waiting for a free slot…',
+                                      fg=SUBT0, wraplength=0)
         else:
             pct = f'{item.progress * 100:.1f}%' if item.status == ConvItem.RUNNING else ''
             wdg['info_lbl'].configure(text=pct, fg=SUBT0, wraplength=0)
 
-        if item.status == ConvItem.DONE:
+        if item.status in (ConvItem.PENDING, ConvItem.QUEUED, ConvItem.RUNNING):
+            # Also the state after a Retry: back to a neutral card.
+            if wdg['card_bg'] != self._CONV_CARD_BG:
+                self._conv_tint(wdg, self._CONV_CARD_BG)
+                wdg['prog'].configure(style='Horizontal.TProgressbar')
+            if item.status == ConvItem.PENDING:
+                # No worker exists yet, so there is nothing to cancel —
+                # cancelling here used to poison the item for its next run.
+                wdg['action_btn'].configure(
+                    text='Remove', state='normal',
+                    bg=self._CONV_CARD_BG, fg=SUBT0, activebackground=SURF1,
+                    command=lambda iid=item.id: self._remove_conv_card(iid))
+            else:
+                wdg['action_btn'].configure(
+                    text='Cancel', state='normal',
+                    bg=self._CONV_CARD_BG, fg=SUBT0, activebackground=SURF1,
+                    command=item.cancel)
+        elif item.status == ConvItem.DONE:
             self._conv_tint(wdg, self._CONV_DONE_BG)
             wdg['prog'].configure(style='Green.Horizontal.TProgressbar')
             wdg['action_btn'].configure(text='✓ Done', state='disabled',
@@ -2925,9 +3342,12 @@ class App(tk.Tk):
 
     def _conv_tint(self, wdg: dict, color: str):
         wdg['card_bg'] = color
-        self._tint_widgets(wdg['card'], color)
+        self._tint_widgets(wdg['card'], color, skip=(wdg.get('ext_badge'),))
 
     def _remove_conv_card(self, item_id: str):
+        item = self.conv_items.get(item_id)
+        if item and item.status in (ConvItem.QUEUED, ConvItem.RUNNING):
+            item.cancel()           # stop the ffmpeg process before its card goes
         wdg = self._conv_widgets.pop(item_id, None)
         if wdg:
             wdg['card'].destroy()
@@ -3022,6 +3442,19 @@ class App(tk.Tk):
         for item in items:
             if item.status != ConvItem.PENDING:
                 continue
+            if item.is_cancelled:
+                item._cancel = threading.Event()
+            # A trim chosen for this file wins over the panel's trim boxes.
+            item_in, item_out = in_args, ffmpeg_args
+            if item.trim:
+                t_start, t_end = item.trim
+                trimmed = self._build_conv_args({
+                    **s,
+                    'conv_trim_start': '' if t_start is None else self._clock(t_start),
+                    'conv_trim_end':   '' if t_end is None else self._clock(t_end)})
+                if not trimmed:
+                    continue
+                item_in, item_out = trimmed[0], trimmed[1]
             # The practice suffix keeps a 75%-speed copy from overwriting the
             # full-speed one when both are made from the same source.
             stem = os.path.splitext(item.filename)[0] + suffix
@@ -3050,12 +3483,13 @@ class App(tk.Tk):
                 skipped += 1
                 continue
 
-            item.status = ConvItem.RUNNING
+            item.status = ConvItem.QUEUED
             item.error  = ''
+            item.out_path = out_path
             self.msg_q.put(('conv_update', item))
             t = threading.Thread(
                 target=self._conv_worker,
-                args=(item, self._ffmpeg_path, in_args, ffmpeg_args,
+                args=(item, self._ffmpeg_path, item_in, item_out,
                       overwrite_flag, out_path, slot),
                 daemon=True)
             self._conv_threads[item.id] = t
@@ -3082,7 +3516,6 @@ class App(tk.Tk):
             self._conv_slot_size = want
         return self._conv_slot
 
-    _DURATION_RE = re.compile(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)')
     _TIME_RE     = re.compile(r'time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)')
 
     def _probe_duration(self, ffmpeg_bin, path):
@@ -3100,6 +3533,8 @@ class App(tk.Tk):
                      ffmpeg_args: list, overwrite: list, out_path: str,
                      slot: threading.Semaphore):
         acquired = False
+        launched = False
+        preexisting = True
         tail: list = []
         try:
             while not slot.acquire(timeout=0.25):
@@ -3110,6 +3545,8 @@ class App(tk.Tk):
             if item.is_cancelled:
                 item.status = ConvItem.CANCELLED
                 return
+            item.status = ConvItem.RUNNING
+            self.msg_q.put(('conv_update', item))
 
             # Probe duration for progress tracking. With a trim applied, ffmpeg
             # reports time= relative to the trimmed output, so the progress
@@ -3125,11 +3562,13 @@ class App(tk.Tk):
             # start instead of decoding and throwing away everything before it.
             cmd = ([ffmpeg_bin, '-hide_banner', '-nostdin'] + overwrite +
                    in_args + ['-i', item.path] + ffmpeg_args + [out_path])
+            preexisting = os.path.exists(out_path)
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 text=True, encoding='utf-8', errors='replace', **kw)
             item._proc = proc
+            launched = True
 
             for piece in self._iter_ffmpeg_chunks(proc.stderr):
                 if item.is_cancelled:
@@ -3176,6 +3615,17 @@ class App(tk.Tk):
             if acquired:
                 slot.release()
             item._proc = None
+            # A cancelled or failed run leaves a truncated output behind, which
+            # with overwrite off then blocks the re-run ("Output already
+            # exists"). Only if ffmpeg actually started: otherwise any file
+            # there is the user's, not ours.
+            if launched and not preexisting and item.status != ConvItem.DONE:
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+            if self._conv_threads.get(item.id) is threading.current_thread():
+                self._conv_threads.pop(item.id, None)
             self.msg_q.put(('conv_update', item))
             tag = {ConvItem.DONE: 'green',
                    ConvItem.CANCELLED: 'yellow'}.get(item.status, 'red')
@@ -3193,7 +3643,7 @@ class App(tk.Tk):
                          DownloadItem.FETCHING)
         active = [i for i in self.items.values() if i.status in active_states]
         if not active:
-            if self._total_prog.winfo_ismapped():
+            if self._total_prog.winfo_manager():
                 self._total_prog.pack_forget()
             done = sum(1 for i in self.items.values()
                        if i.status == DownloadItem.DONE)
@@ -3208,7 +3658,7 @@ class App(tk.Tk):
         self._last_status_summary = ''
         pct = sum(i.progress for i in active) / len(active) * 100
         self._total_prog.configure(value=pct)
-        if not self._total_prog.winfo_ismapped():
+        if not self._total_prog.winfo_manager():
             self._total_prog.pack(side='right', padx=(0, 10))
         self.status_var.set(f'{len(active)} active · {pct:.0f}%')
 
@@ -3235,14 +3685,49 @@ class App(tk.Tk):
         hours, mins = divmod(mins, 60)
         return f'{hours}h{mins:02d}m'
 
+    def _on_close(self):
+        """Window-close handler: confirm if work is running, stop it cleanly.
+
+        Daemon threads die with the process, but an ffmpeg child they started
+        does not — closing mid-conversion used to orphan it.
+        """
+        running = ([i for i in self.items.values() if i.status in DownloadItem.ACTIVE]
+                   + [c for c in self.conv_items.values()
+                      if c.status in (ConvItem.QUEUED, ConvItem.RUNNING)])
+        if running and not messagebox.askyesno(
+                'Quit', f'{len(running)} download(s)/conversion(s) are still '
+                        f'running. Cancel them and quit?\n\n'
+                        f'Unfinished downloads stay in the queue for next time.',
+                parent=self):
+            return
+        for item in running:
+            item.cancel()
+        deadline = time.monotonic() + 3.0
+        for t in list(self._threads.values()) + list(self._conv_threads.values()):
+            t.join(timeout=max(deadline - time.monotonic(), 0))
+        self.destroy()
+
     def destroy(self):
         self._closing = True
+        # Anything typed into a sidebar box but never "applied" would be lost,
+        # since settings are otherwise only collected when a download starts.
         try:
+            for key, var in self._setting_var_map():
+                self.settings[key] = var.get()
+            self._collect_conv_settings()
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            zoomed = self.state() == 'zoomed'
+            self.settings['window_zoomed'] = zoomed
             geo = self.winfo_geometry()
             # Closing while minimised/withdrawn reports a degenerate size like
             # '1x1+0+0'; persisting that reopens the app as an unusable sliver.
+            # A maximized window reports the full-screen size, so keep the
+            # restored size from before instead.
             m = re.match(r'^(\d+)x(\d+)\+', geo)
-            if m and int(m.group(1)) >= 400 and int(m.group(2)) >= 300:
+            if (not zoomed and m and int(m.group(1)) >= 400
+                    and int(m.group(2)) >= 300):
                 self.settings['window_geometry'] = geo
         except Exception:
             pass
@@ -3259,6 +3744,6 @@ class App(tk.Tk):
             if item.status in DownloadItem.ACTIVE:
                 item.cancel()
         for item in self.conv_items.values():
-            if item.status == ConvItem.RUNNING:
+            if item.status in (ConvItem.QUEUED, ConvItem.RUNNING):
                 item.cancel()
         super().destroy()

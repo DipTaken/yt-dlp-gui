@@ -93,8 +93,9 @@ def entry(parent, var):
                     highlightcolor=MAUVE)
 
 def check(parent, text, var):
-    ttk.Checkbutton(parent, text=text, variable=var).pack(
-        anchor='w', padx=16, pady=2)
+    cb = ttk.Checkbutton(parent, text=text, variable=var)
+    cb.pack(anchor='w', padx=16, pady=2)
+    return cb
 
 def labeled_combo(parent, label, var, values, on_select=None):
     """Returns the wrapper frame so callers can use it as a pack anchor."""
@@ -120,6 +121,7 @@ def labeled_entry(parent, label, var, width=None):
         e.pack(anchor='w', pady=(2, 0), ipady=4)
     else:
         e.pack(fill='x', pady=(2, 0), ipady=4)
+    return f
 
 def mini_combo(parent, label, var, values):
     f = tk.Frame(parent, bg=MANTLE)
@@ -137,6 +139,7 @@ def mini_entry(parent, label, var, width=8):
     e = entry(f, var)
     e.configure(width=width)
     e.pack(anchor='w', ipady=4)
+    return f
 
 def browse_row(parent, label, var, cmd):
     f = tk.Frame(parent, bg=MANTLE)

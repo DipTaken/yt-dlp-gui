@@ -85,6 +85,9 @@ def build_audio_filter_chain(tempo_pct=100, semitones=0, channel_filter='',
     if loudnorm:
         parts.append(loudnorm if loudnorm.startswith('loudnorm')
                      else f'loudnorm={loudnorm}')
+        # loudnorm upsamples its output to 192 kHz internally; bring it back
+        # to something sane so FLAC/WAV/AAC/ProRes files aren't hugely inflated.
+        parts.append(f'aresample={_PITCH_RATE}')
 
     return ','.join(parts)
 

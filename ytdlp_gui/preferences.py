@@ -9,6 +9,7 @@ Every control here binds to a Var owned by App (see App._SETTING_VARS), so
 values survive this window being closed and reopened, and the normal
 save-on-collect path picks them up with no special casing.
 """
+import os
 import subprocess
 import sys
 import threading
@@ -16,13 +17,13 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, ttk
 
-from .config import FFMPEG_DOWNLOAD_URL, SETTINGS_FILE
+from .config import FFMPEG_DOWNLOAD_URL, ROOT, SETTINGS_FILE
 from .ffmpeg_utils import find_ffmpeg
 from .theme import (
     BASE, BLUE, GREEN, MANTLE, MAUVE, OVL0, RED, SUBT0, SURF0, SURF1, SURF2,
     TEXT, YELLOW, apply_dark_titlebar,
 )
-from .widgets import WheelRouter, browse_row, check, entry, labeled_combo, labeled_entry, mini_entry
+from .widgets import browse_row, check, entry, labeled_combo, labeled_entry, mini_entry, tooltip
 
 
 class PreferencesWindow(tk.Toplevel):
@@ -36,7 +37,9 @@ class PreferencesWindow(tk.Toplevel):
         self.transient(app)
         apply_dark_titlebar(self)
 
-        self._wheel = WheelRouter(self)
+        # Reuse App's router: a second WheelRouter would bind_all('<MouseWheel>')
+        # over it, and the main window would stop scrolling once this closed.
+        self._wheel = app._wheel
 
         nb = ttk.Notebook(self)
         nb.pack(fill='both', expand=True, padx=10, pady=(10, 0))
@@ -87,6 +90,9 @@ class PreferencesWindow(tk.Toplevel):
     def _close(self):
         # Collecting writes every Var back into settings and saves to disk, so
         # closing the window is what commits the changes.
+        if (hasattr(self, '_ffmpeg_var') and self._ffmpeg_var.get().strip()
+                != self.app.settings.get('ffmpeg_path', '')):
+            self._apply_ffmpeg()          # typed but never Applied
         self.app._collect_settings()
         self.app._refresh_ffmpeg_badge()
         self.destroy()
@@ -100,6 +106,15 @@ class PreferencesWindow(tk.Toplevel):
                      font=('Segoe UI', 8), wraplength=520,
                      justify='left').pack(anchor='w', padx=16, pady=(1, 4))
         tk.Frame(parent, bg=SURF1, height=1).pack(fill='x', padx=16, pady=(2, 6))
+
+    @staticmethod
+    def _tip(frame, text):
+        """Tooltip on a labelled row: the frame and every child, since Enter
+        on a container does not fire while the pointer is over a child."""
+        tooltip(frame, text)
+        for child in frame.winfo_children():
+            tooltip(child, text)
+        return frame
 
     # ── tabs ─────────────────────────────────────────────────────────────────
     def _build_files(self, p):
@@ -157,14 +172,51 @@ class PreferencesWindow(tk.Toplevel):
                  bg=MANTLE, fg=SURF2, font=('Segoe UI', 8),
                  wraplength=520, justify='left').pack(anchor='w', padx=16, pady=(4, 0))
 
+        self._head(p, 'POLITENESS AND TIMEOUTS',
+                   'Pausing between requests avoids rate limits and bans on '
+                   'large playlists. All times are in seconds.')
+        row = tk.Frame(p, bg=MANTLE)
+        row.pack(fill='x', padx=16, pady=3)
+        self._tip(mini_entry(row, 'Sleep Between Downloads', a.sleep_int_var, width=8),
+                  'Seconds to wait before each download. With a Max value, the '
+                  'wait is random between the two. 0 = no wait.')
+        tk.Frame(row, bg=MANTLE, width=14).pack(side='left')
+        self._tip(mini_entry(row, 'Max Sleep', a.sleep_max_var, width=8),
+                  'Upper bound in seconds for a random wait. Only used when '
+                  'Sleep Between Downloads is above 0.')
+        tk.Frame(row, bg=MANTLE, width=14).pack(side='left')
+        self._tip(mini_entry(row, 'Sleep Between Requests', a.sleep_req_var, width=8),
+                  'Seconds to wait between metadata requests while extracting '
+                  'a playlist. 0 = no wait.')
+        row = tk.Frame(p, bg=MANTLE)
+        row.pack(fill='x', padx=16, pady=3)
+        self._tip(mini_entry(row, 'Socket Timeout', a.socket_timeout_var, width=8),
+                  'Seconds to wait on a stalled connection before giving up. '
+                  '0 = yt-dlp default.')
+        tk.Frame(row, bg=MANTLE, width=14).pack(side='left')
+        self._tip(mini_entry(row, 'Extractor Retries', a.extractor_retries_var, width=8),
+                  'How many times to retry when a site returns an error while '
+                  'reading the page (not the download itself). Blank = default (3).')
+        cb = check(p, 'Force IPv4', a.force_ipv4_var)
+        tooltip(cb, 'Connect over IPv4 only. Helps when a broken IPv6 route '
+                    'makes downloads hang or get blocked.')
+
     def _build_cookies(self, p):
         a = self.app
         self._head(p, 'COOKIES',
                    'Needed for age-restricted, members-only and private videos. '
                    'Importing from a browser requires that browser to be closed.')
-        labeled_combo(p, 'Import from Browser', a.cookie_browser_var,
-                      ['', 'chrome', 'firefox', 'edge', 'brave', 'safari',
-                       'chromium', 'opera', 'vivaldi'])
+        cf = labeled_combo(p, 'Import from Browser', a.cookie_browser_var,
+                           ['', 'chrome', 'firefox', 'edge', 'brave', 'safari',
+                            'chromium', 'opera', 'vivaldi'])
+        # Editable so a profile can be typed: the list only offers bare names.
+        for w in cf.winfo_children():
+            if isinstance(w, ttk.Combobox):
+                w.configure(state='normal')
+        tk.Label(p, text="Pick a browser or type browser:profile, e.g. "
+                         "'chrome:Profile 1' or 'firefox:default-release'.",
+                 bg=MANTLE, fg=SURF2, font=('Segoe UI', 8), wraplength=520,
+                 justify='left').pack(anchor='w', padx=16, pady=(1, 0))
         browse_row(p, 'Cookie File (Netscape format)', a.cookie_file_var,
                    self._browse_cookies)
 
@@ -180,6 +232,26 @@ class PreferencesWindow(tk.Toplevel):
         mini_entry(row, 'Uploaded After  (YYYYMMDD)', a.date_after_var, width=13)
         tk.Frame(row, bg=MANTLE, width=14).pack(side='left')
         mini_entry(row, 'Uploaded Before (YYYYMMDD)', a.date_before_var, width=13)
+        self._tip(labeled_entry(p, 'Playlist Items (e.g. 1-10,15 or -3:)',
+                                a.playlist_items_var, width=24),
+                  'Download only these positions of a playlist. Comma-separated '
+                  'numbers or ranges, counted from 1: 1-10,15 takes the first ten '
+                  'plus the 15th. Blank = everything.')
+
+        self._head(p, 'FILES AND THUMBNAILS')
+        self._tip(labeled_entry(p, 'Trim Filenames To (characters, blank = no limit)',
+                                a.trim_name_var, width=10),
+                  'Cut file names longer than this many characters. 180 keeps '
+                  'long titles inside the Windows path limit.')
+        tooltip(check(p, 'Convert kept thumbnails to JPG', a.thumb_jpg_var),
+                'Only applies when Save Thumbnail is on. Turns webp thumbnails '
+                'into JPG so ordinary viewers can open them.')
+        tooltip(check(p, 'Stop at the first already-downloaded video',
+                      a.break_existing_var),
+                'Only applies with the download archive on. Ends the playlist '
+                'run at the first video already in the archive instead of '
+                'checking the rest. Handy for "just the new uploads" on a '
+                'newest-first channel.')
 
     def _build_tools(self, p):
         a = self.app
@@ -242,10 +314,16 @@ class PreferencesWindow(tk.Toplevel):
                                      cursor='hand2', activebackground=SURF1,
                                      activeforeground=TEXT)
         self._update_btn.pack(side='right')
+        self._update_mode = self._update_mode_hint()
+        if self._update_mode:
+            self._update_btn.configure(state='disabled',
+                                       text='Update unavailable')
         self._update_status = tk.Label(p, text='', bg=MANTLE, fg=SUBT0,
                                        font=('Segoe UI', 8), wraplength=520,
                                        justify='left')
         self._update_status.pack(anchor='w', padx=16, pady=(4, 0))
+        if self._update_mode:
+            self._update_status.configure(text=self._update_mode)
 
     # ── actions ──────────────────────────────────────────────────────────────
     def _browse_archive(self):
@@ -285,6 +363,26 @@ class PreferencesWindow(tk.Toplevel):
         self._ffmpeg_status.configure(
             text=f'Using: {resolved}' if resolved else 'No usable ffmpeg found.',
             fg=GREEN if resolved else RED)
+
+    @staticmethod
+    def _update_mode_hint():
+        """Why pip cannot update yt-dlp here, or '' when it can.
+
+        From source the vendored copy wins on sys.path, so pip would change
+        nothing; frozen, sys.executable is the GUI itself and would launch a
+        second window instead of pip.
+        """
+        if getattr(sys, 'frozen', False):
+            return 'Rebuild the app to update the bundled yt-dlp.'
+        try:
+            import yt_dlp
+            here = os.path.normcase(os.path.abspath(yt_dlp.__file__))
+            if here.startswith(os.path.normcase(os.path.abspath(ROOT)) + os.sep):
+                return ('Vendored copy: update with git merge upstream/master, '
+                        'then python check_sync.py.')
+        except Exception:
+            pass
+        return ''
 
     def _run_update(self):
         self._update_btn.configure(state='disabled', text='Updating…')

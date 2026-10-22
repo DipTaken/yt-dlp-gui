@@ -72,7 +72,9 @@ def build_conv_args(s: dict, warn, error) -> 'tuple[list, list, str] | None':
             out_args += ['-b:a', f'{q}k']
     elif kind == 'video':
         crf = int_or_none(s['conv_video_crf'])
-        if crf is None or not 0 <= crf <= 63:
+        # libx265 tops out at 51; VP9 (WebM) goes to 63.
+        hi = 63 if fmt == 'WebM' else 51
+        if crf is None or not 0 <= crf <= hi:
             warn(f'CRF {s["conv_video_crf"]!r} out of range — using 23.')
             crf = 23
         out_args += ['-crf', str(crf)]
@@ -136,8 +138,9 @@ def build_conv_args(s: dict, warn, error) -> 'tuple[list, list, str] | None':
             warn('Trim end is not after trim start — ignoring trim.')
             in_args, end = [], None
         else:
-            # -to after -i is relative to the trimmed start, so pass the
-            # duration instead of an absolute stamp.
-            out_args += ['-t', str(end - (start or 0))]
+            # A duration, not an absolute stamp. It goes before -i (an input
+            # option) so it is measured on the source: as an output option it
+            # would count output time, which atempo has already stretched.
+            in_args += ['-t', str(end - (start or 0))]
 
     return in_args, out_args, ext

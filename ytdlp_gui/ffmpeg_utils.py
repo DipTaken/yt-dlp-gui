@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 
+from .audio_filters import _PITCH_RATE
 from .config import ROOT
 
 _FFMPEG_SEARCH_PATHS = [
@@ -107,10 +108,23 @@ def effective_duration(probed: float, in_args: list, out_args: list) -> float:
         ss = after(in_args, '-ss')
         if ss:
             probed = max(probed - ss, 0.0)
-    t = after(out_args, '-t')
+    t = after(in_args, '-t') or after(out_args, '-t')
     if t:
         probed = min(probed, t) if probed > 0 else t
-    return probed
+    # ffmpeg's time= counts *output* time, so a tempo change moves the finish
+    # line: at 50% speed the output is twice as long as the input.
+    speed = 1.0
+    try:
+        chain = out_args[out_args.index('-af') + 1]
+        for part in chain.split(','):
+            name, _, val = part.partition('=')
+            if name == 'atempo':
+                speed *= float(val)
+            elif name == 'asetrate':
+                speed *= float(val) / _PITCH_RATE
+    except (ValueError, IndexError):
+        pass
+    return probed / speed if speed > 0 else probed
 
 
 def iter_ffmpeg_chunks(stream):

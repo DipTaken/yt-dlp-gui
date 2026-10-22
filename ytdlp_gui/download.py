@@ -10,9 +10,13 @@ before changing anything.
 import os
 import re
 
+from yt_dlp.dependencies import mutagen
 from yt_dlp.postprocessor import MetadataParserPP
-from yt_dlp.postprocessor.ffmpeg import ACODECS
-from yt_dlp.utils import DateRange, download_range_func, parse_bytes, parse_duration
+from yt_dlp.postprocessor.ffmpeg import ACODECS, FFmpegExtractAudioPP
+from yt_dlp.postprocessor.sponsorblock import SponsorBlockPP
+from yt_dlp.utils import (
+    DateRange, download_range_func, parse_bytes, parse_duration, parse_filesize,
+)
 
 from .audio_filters import build_audio_filter_chain, practice_suffix
 from .config import (
@@ -73,7 +77,10 @@ def build_format_opts(item, s: dict, warn) -> dict:
     selector, height_cap = FORMAT_PRESETS.get(
         preset, FORMAT_PRESETS['Best (Video + Audio)'])
 
-    audio_only = bool(s['audio_extract']) or preset == 'Audio Only (Best)'
+    # With "keep the original video" on, the video has to be downloaded too;
+    # an audio-only selector would leave nothing to keep.
+    audio_only = ((bool(s['audio_extract']) and not s.get('keep_video'))
+                  or preset == 'Audio Only (Best)')
 
     if item.format_override:
         # Chosen explicitly in the info popup; respect it verbatim and skip
@@ -81,7 +88,20 @@ def build_format_opts(item, s: dict, warn) -> dict:
         return {'format': item.format_override}
 
     if audio_only:
-        return {'format': 'ba/b', 'format_sort': ['acodec:aac', 'abr']}
+        # Prefer the source that needs the least work for the target: AAC for
+        # the MP4-family targets (and plain audio-only downloads), Opus for
+        # Opus, yt-dlp's own ranking for anything else.
+        fmt = s.get('audio_format')
+        if fmt in ('m4a', 'aac', 'alac') or not s['audio_extract']:
+            sort = ['acodec:aac', 'abr']
+        elif fmt == 'opus':
+            sort = ['acodec:opus', 'abr']
+        else:
+            sort = []
+        out = {'format': 'ba/b'}
+        if sort:
+            out['format_sort'] = sort
+        return out
 
     if preset == 'Custom…':
         custom = (s['custom_format'] or '').strip()
@@ -105,31 +125,137 @@ def build_format_opts(item, s: dict, warn) -> dict:
         out['merge_output_format'] = mode['merge']
     return out
 
-def build_postprocessors(s: dict) -> tuple:
-    """Build the postprocessor chain.
+# Sample rates each lossy encoder will actually accept.
+_ENCODER_RATES = {
+    'opus': {48000, 24000, 16000, 12000, 8000},
+    'mp3':  {8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000},
+}
+
+
+def _audio_quality_args(fmt: str, quality) -> list:
+    """Bitrate/quality flags for the practice re-encode.
+
+    The practice pass re-encodes after ExtractAudio, so ExtractAudio's own
+    quality setting no longer applies to the final file; restate it here.
+    """
+    if fmt in ('flac', 'wav', 'alac'):
+        return []
+    q = str(quality or '').strip()
+    if q in ('', 'best', '0'):
+        return {'mp3': ['-q:a', '0'], 'vorbis': ['-q:a', '10']}.get(
+            fmt, ['-b:a', '256k'])
+    if q.isdigit():
+        return ['-b:a', f'{q}k']
+    return []
+
+
+def build_practice_args(s: dict, warn=None) -> list:
+    """ffmpeg arguments for the practice / loudness / sample-rate pass.
+
+    Returned as the `copystream` postprocessor_args. They go to a dedicated
+    FFmpegCopyStream PP rather than to ExtractAudio because ExtractAudio
+    returns early (doing nothing at all) when the source is already in the
+    target codec, which silently discarded the filters for m4a/aac and for an
+    mp3 source. The args are always paired with an explicit `-c:a`: the copy
+    PP starts from `-c copy`, and filters against a copied stream make ffmpeg
+    exit with "Invalid argument". Ours win, being appended last.
+    """
+    if not s['audio_extract']:
+        return []
+    fmt = s['audio_format']
+    chain = build_audio_filter_chain(
+        s.get('audio_tempo', '100'), s.get('audio_transpose', '0'),
+        AUDIO_CHANNEL_MODES.get(s.get('audio_channels', 'Stereo'), ''),
+        'loudnorm' if s.get('audio_normalize') else '')
+    rate = str(s.get('audio_sample_rate') or '').strip()
+    if rate:
+        try:
+            r = int(rate)
+        except ValueError:
+            r = None
+        key = fmt if fmt in _ENCODER_RATES else None
+        if r is not None and key and r not in _ENCODER_RATES[key]:
+            if warn:
+                warn(f'{fmt} cannot be {r} Hz — using 48000.')
+            rate = '48000'
+    if not chain and not rate:
+        return []
+
+    quality = s.get('audio_quality')
+    if quality == 'best' and fmt == 'opus':
+        quality = '256'
+    args: list = []
+    encoder = audio_encoder_for(fmt)
+    if encoder:
+        args += ['-c:a', encoder]
+    args += _audio_quality_args(fmt, quality)
+    if chain:
+        args += ['-af', chain]
+    if rate:
+        args += ['-ar', rate]
+    return args
+
+
+def _tempo_changed(s: dict) -> bool:
+    try:
+        tempo = float(str(s.get('audio_tempo', '100')).strip().rstrip('%'))
+    except ValueError:
+        return False
+    return bool(s['audio_extract']) and abs(tempo - 100.0) > 1e-9
+
+
+def plan_postprocessors(s: dict, warn=None) -> dict:
+    """Build the postprocessor chain and the data that goes with it.
 
     Order matters and mirrors yt-dlp's own CLI (yt_dlp/__init__.py,
-    get_postprocessors): extract audio → embed subs → modify chapters →
-    metadata → embed thumbnail. Running EmbedThumbnail before FFmpegMetadata
-    (as this file used to) makes the metadata pass remux the file and drop
-    the artwork that was just embedded.
+    get_postprocessors): SponsorBlock → extract audio → embed subs → modify
+    chapters → [practice re-encode] → metadata → embed thumbnail → split.
+    Running EmbedThumbnail before FFmpegMetadata makes the metadata pass remux
+    the file and drop the artwork that was just embedded.
 
-    Returns (postprocessors, needs_thumbnail_download).
+    Returns a dict: `pp`, `want_thumb_file`, `forced_thumb` (the thumbnail is
+    written only so it can be embedded) and `practice_args`.
     """
+    def say(msg):
+        if warn:
+            warn(msg)
+
     pp: list[dict] = []
     want_thumb_file = bool(s['write_thumbnail'])
     embed_thumb     = bool(s['embed_thumbnail'])
     want_subs       = bool(s['write_subs'] or s['auto_subs'])
     embed_subs      = bool(s['embed_subs'] and want_subs)
+    sped            = _tempo_changed(s)
+
+    # Some audio containers cannot carry cover art, and a failed embed fails
+    # the whole item (no post_hooks fire, the card goes red). Skip it up front.
+    if embed_thumb and s['audio_extract']:
+        tgt = ACODECS.get(s['audio_format'], (None,))[0]
+        if tgt == 'wav':
+            say('Cannot embed a thumbnail in .wav — skipping.')
+            embed_thumb = False
+        elif tgt in ('ogg', 'opus', 'flac') and not mutagen:
+            say(f'Cannot embed a thumbnail in .{tgt} (mutagen not installed) '
+                '— skipping.')
+            embed_thumb = False
 
     sb_cats: list = []
     # SponsorBlock queries the API before download so later passes can act
     # on the chapter data ('after_filter' is what the CLI uses).
     if s['sponsorblock_enabled']:
-        sb_cats = [c.strip() for c in s['sponsorblock_cats'].split(',') if c.strip()]
-        if not sb_cats or 'all' in sb_cats:
-            sb_cats = ['sponsor', 'intro', 'outro', 'selfpromo',
-                       'interaction', 'music_offtopic', 'preview', 'filler']
+        valid = [c for c in SponsorBlockPP.CATEGORIES
+                 if c not in SponsorBlockPP.NON_SKIPPABLE_CATEGORIES]
+        typed = [c.strip() for c in (s['sponsorblock_cats'] or '').split(',')
+                 if c.strip()]
+        if not typed or 'all' in typed:
+            sb_cats = valid
+        else:
+            sb_cats = [c for c in typed if c in valid]
+            unknown = [c for c in typed if c not in valid]
+            if unknown:
+                say(f'Unknown SponsorBlock categories ignored: {", ".join(unknown)}.')
+            if not sb_cats:
+                sb_cats = valid
         pp.append({'key': 'SponsorBlock', 'categories': sb_cats,
                    'when': 'after_filter'})
 
@@ -148,10 +274,17 @@ def build_postprocessors(s: dict) -> tuple:
         pp.append({'key': 'FFmpegSubtitlesConvertor',
                    'format': sub_fmt, 'when': 'before_dl'})
 
+    # A thumbnail kept on disk can be normalised to jpg (opt-in).
+    if s['write_thumbnail'] and s.get('thumbnail_to_jpg'):
+        pp.append({'key': 'FFmpegThumbnailsConvertor',
+                   'format': 'jpg', 'when': 'before_dl'})
+
     if s['audio_extract']:
         quality = s['audio_quality']
         if quality == 'best':
-            quality = '0'          # 0 = best VBR for the target encoder
+            # 0 = best VBR for the target encoder; libopus has no VBR scale
+            # and would fall back to ~96k, so ask for a real bitrate there.
+            quality = '256' if s['audio_format'] == 'opus' else '0'
         pp.append({'key': 'FFmpegExtractAudio',
                    'preferredcodec': s['audio_format'],
                    'preferredquality': quality})
@@ -173,28 +306,95 @@ def build_postprocessors(s: dict) -> tuple:
                    'remove_ranges': [],
                    'force_keyframes': bool(s.get('clip_precise')) if removing else False})
 
-    if s['embed_metadata']:
-        pp.append({'key': 'FFmpegMetadata',
-                   'add_metadata': True,
-                   'add_chapters': True})
+    # The practice re-encode runs after every pass that works in original
+    # timestamps (SponsorBlock cuts) and before the metadata pass.
+    practice_args = build_practice_args(s, warn)
+    if practice_args:
+        if sped:
+            # Chapter times describe the original; after a speed change they
+            # would all be wrong, so drop them rather than write bad ones.
+            practice_args += ['-map_chapters', '-1']
+        pp.append({'key': 'FFmpegCopyStream'})
 
+    # Mark-as-chapters needs FFmpegMetadata too, even with tags switched off:
+    # it is the only postprocessor that writes chapters into the file.
+    marking = (s['sponsorblock_enabled']
+               and s.get('sponsorblock_mode') != 'Remove from file')
+    add_chapters = not sped
+    if s['embed_metadata'] or (marking and add_chapters):
+        pp.append({'key': 'FFmpegMetadata',
+                   'add_metadata': bool(s['embed_metadata']),
+                   'add_chapters': add_chapters})
+
+    forced_thumb = False
     if embed_thumb:
         # already_have_thumbnail=True stops yt-dlp deleting a thumbnail the
         # user explicitly asked to keep.
         pp.append({'key': 'EmbedThumbnail',
                    'already_have_thumbnail': want_thumb_file})
         # The thumbnail has to be on disk before it can be embedded. yt-dlp's
-        # CLI force-enables this; doing it by hand is required here, and its
+        # CLI force-enables it; doing it by hand is required here, and its
         # absence is why "Embed Thumbnail" alone silently did nothing.
+        forced_thumb = not want_thumb_file
         want_thumb_file = True
 
     # Splitting runs last so each piece inherits the finished file's tags,
     # chapters and artwork.
     if s.get('split_chapters'):
-        pp.append({'key': 'FFmpegSplitChapters',
-                   'force_keyframes': bool(s.get('clip_precise'))})
+        if sped:
+            say('Split chapters is off for a speed-changed copy.')
+        else:
+            pp.append({'key': 'FFmpegSplitChapters',
+                       'force_keyframes': bool(s.get('clip_precise'))})
 
-    return pp, want_thumb_file
+    return {'pp': pp, 'want_thumb_file': want_thumb_file,
+            'forced_thumb': forced_thumb, 'practice_args': practice_args}
+
+
+def build_postprocessors(s: dict, warn=None) -> tuple:
+    """Compatibility wrapper: (postprocessors, needs_thumbnail_download)."""
+    plan = plan_postprocessors(s, warn)
+    return plan['pp'], plan['want_thumb_file']
+
+
+def network_opts(s: dict, warn=None) -> dict:
+    """Proxy + cookie options, shared by every place that talks to yt-dlp."""
+    opts: dict = {}
+    if s.get('proxy'):
+        opts['proxy'] = s['proxy']
+    browser = (s.get('cookie_browser') or '').strip()
+    if browser:
+        # "chrome", "chrome:Profile 1" or "firefox+gnomekeyring:default"
+        name, _, profile = browser.partition(':')
+        name, _, keyring = name.partition('+')
+        name = name.strip().lower()
+        from yt_dlp.cookies import SUPPORTED_BROWSERS
+        if name in SUPPORTED_BROWSERS:
+            opts['cookiesfrombrowser'] = (
+                name, profile.strip() or None, keyring.strip().upper() or None)
+        elif warn:
+            warn(f'Unknown cookie browser, ignoring: {name or browser}')
+    cookie_file = s.get('cookie_file')
+    if cookie_file:
+        if os.path.isfile(cookie_file):
+            opts['cookiefile'] = cookie_file
+        elif warn:
+            warn(f'Cookie file not found, ignoring: {cookie_file}')
+    return opts
+
+
+def _bytes_or_none(raw):
+    raw = str(raw).strip()
+    return parse_bytes(raw) or parse_filesize(raw)
+
+
+def _pos_number(value):
+    try:
+        v = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
 
 def parse_clip_range(s: dict, warn) -> 'tuple[float, float] | None':
     """Turn the Start/End boxes into (start_secs, end_secs), or None.
@@ -230,9 +430,11 @@ def parse_clip_range(s: dict, warn) -> 'tuple[float, float] | None':
 
 def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
                    progress_hook, pp_hook, warn, post_hook=None) -> dict:
-    pp, want_thumb_file = build_postprocessors(s)
+    plan = plan_postprocessors(s, warn)
+    pp, want_thumb_file = plan['pp'], plan['want_thumb_file']
+    practice_args = plan['practice_args']
 
-    template = s['output_template'] or '%(title)s [%(id)s].%(ext)s'
+    template = (s['output_template'] or '').strip() or '%(title)s [%(id)s].%(ext)s'
 
     # A clip range has to show up in the name. yt-dlp renders every range
     # through the *default* template, so without this two sections of one
@@ -277,6 +479,9 @@ def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
         'quiet':             True,
         'no_warnings':       False,
         'noprogress':        True,
+        # Escape codes would otherwise leak into the log and error text when
+        # the app is launched from a colour terminal.
+        'color':             {'stdout': 'never', 'stderr': 'never'},
         'logger':            logger,
         'progress_hooks':      [progress_hook],
         'postprocessor_hooks': [pp_hook],
@@ -290,56 +495,48 @@ def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
         opts['post_hooks'] = [post_hook]
     opts.update(build_format_opts(item, s, warn))
 
-    # Audio postprocessor extra args (practice filters / normalize / rate).
-    # Keys are matched case-insensitively against a *lower-cased* pp key, so
-    # 'FFmpegExtractAudio' — the old value here — never matched anything and
-    # both options were silently discarded.
-    if s['audio_extract']:
-        pp_extra: list[str] = []
-        chain = build_audio_filter_chain(
-            s.get('audio_tempo', '100'), s.get('audio_transpose', '0'),
-            AUDIO_CHANNEL_MODES.get(s.get('audio_channels', 'Stereo'), ''),
-            'loudnorm' if s.get('audio_normalize') else '')
-        if chain:
-            pp_extra += ['-af', chain]
-        if s.get('audio_sample_rate'):
-            pp_extra += ['-ar', str(s['audio_sample_rate'])]
-        if pp_extra:
-            # ExtractAudio stream-copies whenever the source is already in the
-            # target codec (every m4a/opus download from YouTube), emitting
-            # `-acodec copy`. Filters against a copied stream make ffmpeg exit
-            # with "Invalid argument" and lose the file, so an explicit encoder
-            # — which wins, being last on the command line — has to come with
-            # them. Verified against ffmpeg 8.1.
-            encoder = audio_encoder_for(s['audio_format'])
-            prefix = ['-c:a', encoder] if encoder else []
-            opts['postprocessor_args'] = {'extractaudio': prefix + pp_extra}
+    # Practice filters / normalize / sample rate. Keyed 'copystream' (the
+    # lower-cased PP name without 'FFmpeg' or 'PP'), and carried by a dedicated
+    # FFmpegCopyStream pass because ExtractAudio does nothing when the source is
+    # already in the target codec. See build_practice_args.
+    if practice_args:
+        opts['postprocessor_args'] = {'copystream': practice_args}
 
-    # FFmpeg location
+    if plan['forced_thumb']:
+        # The thumbnail is only on disk to be embedded; like the CLI, don't let
+        # yt-dlp also write the playlist's thumbnail through the default template.
+        opts['outtmpl']['pl_thumbnail'] = ''
+
+    # Mirrors the CLI: lets yt-dlp recognise an existing `Title [id].mp3` as
+    # already downloaded instead of fetching the source again.
+    if s['audio_extract'] and s['audio_format'] in FFmpegExtractAudioPP.SUPPORTED_EXTS:
+        opts['final_ext'] = s['audio_format']
+
+    # FFmpeg location. A file path is fine: yt-dlp finds ffprobe beside it, and
+    # unlike the bare folder this still works for a custom-named executable.
     if ffmpeg_path:
-        opts['ffmpeg_location'] = os.path.dirname(ffmpeg_path)
+        opts['ffmpeg_location'] = ffmpeg_path
     elif pp or opts.get('merge_output_format'):
         warn('FFmpeg not found — merging, audio extraction, '
-                   'thumbnail and subtitle embedding will not work.')
+             'thumbnail and subtitle embedding will not work.')
 
     # ── Numeric / typed options ──────────────────────────────────────────
     # ratelimit and max_filesize are bytes *numbers* in yt-dlp; handing them
     # the raw '2M' / '500M' strings from the UI raised a TypeError mid-run.
     if s['rate_limit']:
-        limit = parse_bytes(s['rate_limit'])
+        limit = _bytes_or_none(s['rate_limit'])
         if limit:
             opts['ratelimit'] = limit
         else:
             warn(f'Could not parse rate limit {s["rate_limit"]!r} — ignoring.')
     if s['max_filesize']:
-        maxfs = parse_bytes(s['max_filesize'])
+        maxfs = _bytes_or_none(s['max_filesize'])
         if maxfs:
             opts['max_filesize'] = maxfs
         else:
             warn(f'Could not parse max filesize {s["max_filesize"]!r} — ignoring.')
 
-    if s['proxy']:
-        opts['proxy'] = s['proxy']
+    opts.update(network_opts(s, warn))
 
     retries = int_or_none(s['retries'])
     if retries is not None:
@@ -353,9 +550,13 @@ def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
     # 'dateafter'/'datebefore' keys are CLI-only names that YoutubeDL never
     # reads, so both date filters used to do nothing at all.
     if s['date_after'] or s['date_before']:
+        def _date(v):
+            # 2024-01-01 -> 20240101; yt-dlp's own parser rejects the dashes.
+            v = (v or '').strip()
+            return re.sub(r'^(\d{4})-(\d{2})-(\d{2})$', r'\1\2\3', v) or None
         try:
-            opts['daterange'] = DateRange(s['date_after'] or None,
-                                          s['date_before'] or None)
+            opts['daterange'] = DateRange(_date(s['date_after']),
+                                          _date(s['date_before']))
         except Exception as exc:
             warn(f'Invalid date filter ({exc}) — ignoring.')
 
@@ -386,12 +587,30 @@ def build_ydl_opts(item, s: dict, *, ffmpeg_path: str, logger,
         except OSError as exc:
             warn(f'Cannot use archive file {archive!r} ({exc}) — ignoring.')
 
-    if s['cookie_browser']:
-        opts['cookiesfrombrowser'] = (s['cookie_browser'],)
-    if s['cookie_file']:
-        if os.path.isfile(s['cookie_file']):
-            opts['cookiefile'] = s['cookie_file']
-        else:
-            warn(f'Cookie file not found, ignoring: {s["cookie_file"]}')
+    # ── Optional politeness / robustness knobs (all default off) ─────────
+    # Read with .get so a settings dict from before these existed still works.
+    for key in ('sleep_interval', 'max_sleep_interval', 'sleep_interval_requests'):
+        v = _pos_number(s.get(key))
+        if v:
+            opts[key] = v
+    if opts.get('max_sleep_interval') and not opts.get('sleep_interval'):
+        # yt-dlp only honours the upper bound alongside a lower one.
+        del opts['max_sleep_interval']
+    items = (s.get('playlist_items') or '').strip()
+    if items:
+        opts['playlist_items'] = items
+    timeout = _pos_number(s.get('socket_timeout'))
+    if timeout:
+        opts['socket_timeout'] = timeout
+    if s.get('force_ipv4'):
+        opts['source_address'] = '0.0.0.0'
+    ex_retries = int_or_none(s.get('extractor_retries'))
+    if ex_retries is not None and ex_retries >= 0 and s.get('extractor_retries') != '':
+        opts['extractor_retries'] = ex_retries
+    trim = int_or_none(s.get('trim_file_name'))
+    if trim and trim > 0:
+        opts['trim_file_name'] = trim
+    if s.get('break_on_existing') and 'download_archive' in opts:
+        opts['break_on_existing'] = True
 
     return opts

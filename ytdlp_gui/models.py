@@ -112,6 +112,12 @@ class GUILogger:
         self._q.put(('note_error', self._id, msg.rstrip('\n')))
 
 
+def _short_clock(t) -> str:
+    m, s = divmod(int(t), 60)
+    h, m = divmod(m, 60)
+    return f'{h:d}:{m:02d}:{s:02d}' if h else f'{m:d}:{s:02d}'
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DownloadItem
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,9 +158,16 @@ class DownloadItem:
         # Converter preset to run over the finished file, snapshotted when the
         # download starts so changing the sidebar mid-queue changes nothing.
         self.post_convert: str = ''
+        # True when the title came from somewhere more specific than the video
+        # (a chapter name), so progress/metadata must not overwrite it.
+        self.title_locked: bool = False
+        # Set when the user paused: a cancel that Retry/Resume continues from
+        # the .part file rather than starting over.
+        self.paused: bool = False
 
         # ── filled in as the download proceeds ──
         self.paths: list = []           # final files, from yt-dlp's post_hooks
+        self._chained: set = set()      # paths already handed to the Converter
         self.duration: float = 0.0
         self.uploader: str = ''
         self.note: str = ''             # secondary line, e.g. partial playlist
@@ -184,6 +197,8 @@ class DownloadItem:
         self.size_str = ''
         self.note     = ''
         self.paths    = []
+        self._chained = set()
+        self.paused   = False
         self.entry_index = 0
         self.filesize = 0
 
@@ -208,8 +223,9 @@ class DownloadItem:
             return None
         rng = data.get('clip_range')
         try:
-            clip = (float(rng[0]), float(rng[1])) if rng and len(rng) == 2 else None
-        except (TypeError, ValueError):
+            clip = (float(rng[0]), float(rng[1])) if (
+                isinstance(rng, (list, tuple)) and len(rng) == 2) else None
+        except (TypeError, ValueError, KeyError, IndexError):
             clip = None
         item = cls(str(data['url']), clip_range=clip)
         item.title = str(data.get('title') or data['url'])
@@ -223,14 +239,9 @@ class DownloadItem:
         if not self.clip_range:
             return ''
 
-        def clock(t):
-            m, s = divmod(int(t), 60)
-            h, m = divmod(m, 60)
-            return f'{h:d}:{m:02d}:{s:02d}' if h else f'{m:d}:{s:02d}'
-
         start, end = self.clip_range
-        tail = 'end' if end == float('inf') else clock(end)
-        return f'{clock(start)} – {tail}'
+        tail = 'end' if end == float('inf') else _short_clock(end)
+        return f'{_short_clock(start)} – {tail}'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +249,7 @@ class DownloadItem:
 # ─────────────────────────────────────────────────────────────────────────────
 class ConvItem:
     PENDING   = 'pending'
+    QUEUED    = 'queued'     # started, waiting for a conversion slot
     RUNNING   = 'running'
     DONE      = 'done'
     ERROR     = 'error'
@@ -253,6 +265,28 @@ class ConvItem:
         self.error    = ''
         self._proc: 'subprocess.Popen | None' = None
         self._cancel  = threading.Event()
+        # Per-file trim (start, end) in seconds; either may be None. Chosen
+        # per file in the clip editor, so it belongs here, not in the panel.
+        self.trim: 'tuple | None' = None
+        self.out_path = ''       # set when a conversion starts
+        # Settings to reuse on Retry (the after-download chain's preset),
+        # or None to use whatever the Converter panel shows.
+        self.retry_settings: 'dict | None' = None
+
+    def reset(self):
+        """Back to PENDING for a retry; keeps the trim."""
+        self._cancel  = threading.Event()
+        self.status   = self.PENDING
+        self.progress = 0.0
+        self.error    = ''
+
+    @property
+    def trim_label(self) -> str:
+        if not self.trim:
+            return ''
+        start, end = self.trim
+        return (f'{_short_clock(start or 0)} – '
+                f'{_short_clock(end) if end is not None else "end"}')
 
     def cancel(self):
         self._cancel.set()
